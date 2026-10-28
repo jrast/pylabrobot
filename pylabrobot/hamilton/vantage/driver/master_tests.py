@@ -134,6 +134,10 @@ def machine(
       return [echo(command)]
     if module_and_command in ("A1PMDI", "A1RMDI", "A1RMGP"):
       return [echo(command, error=0 if arm_up[0] else 16)]
+    if module_and_command in ("A1RMGA", "A1RMDN", "A1RMDG", "A1RMDR"):
+      return [echo(command, error=0 if arm_up[0] else 16)]
+    if module_and_command in ("A1RMQR", "A1RMQI"):
+      return [echo(command)]
     return None
 
   return answers
