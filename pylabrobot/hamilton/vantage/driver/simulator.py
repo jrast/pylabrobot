@@ -26,6 +26,19 @@ def parameters(command: str) -> Dict[str, str]:
   return dict(_PARAMETER.findall(command[found.end() :]))
 
 
+def positions(value: str, count: int) -> List[float]:
+  """A list of lengths as a command writes it, in mm, one entry for each channel.
+
+  As `channel_pattern`, a `&` after the last value means "that value again for every channel that
+  is left".
+  """
+  repeated = value.rstrip().endswith("&")
+  digits = value.replace("&", " ").split()
+  if repeated and digits:
+    digits += [digits[-1]] * (count - len(digits))
+  return [int(digit) / 10 for digit in digits[:count]]
+
+
 def channel_pattern(value: str, num_channels: int) -> List[bool]:
   """A tip pattern as the command writes it, one entry per channel of the machine.
 
@@ -120,6 +133,15 @@ class VantageSimulationDriver(VantageDriver):
     self.ipg_orientation_prepared: bool = False
     """Whether the wrist has been turned to a grip orientation since the IPG was initialized."""
 
+    self.channel_x: List[float] = [0.0] * num_channels
+    """Where each channel stands along X, in mm, after the last move that said so."""
+
+    self.channel_y: List[float] = [0.0] * num_channels
+    """Where each channel stands along Y, in mm, after the last move that said so."""
+
+    self.channel_z: List[float] = [0.0] * num_channels
+    """Where each channel stands along Z, in mm, after the last move that said so."""
+
     self.commands: List[str] = []
     """Every command the driver sent, as it would have gone on the wire."""
 
@@ -193,6 +215,18 @@ class VantageSimulationDriver(VantageDriver):
             "rr0 272" if self.ipg_parked else "rr45 271",
           ),
           "A1RMRS": lambda command: (0, "rs6300 2800 700rr0 272"),
+          "A1PMDY": self._move_all_channels_in_y,
+          "A1PMDZ": self._move_all_channels_in_z,
+          "A1PMDV": self._move_one_channel_in_y,
+          "A1PMDU": self._move_one_channel_in_z,
+          "A1PMDN": self._move_channels_to_positions,
+          "A1PMDQ": lambda command: (0, ""),
+          "A1PMRY": lambda command: (0, ""),
+          "A1PMRB": lambda command: (0, ""),
+          "A1PMRZ": lambda command: (0, ""),
+          "A1PMRD": lambda command: (0, ""),
+          "A1PMRL": lambda command: (0, ""),
+          "A1PMQF": lambda command: (0, ""),
           "A1RMDI": self._initialize_ipg,
           "A1RMGP": self._park_ipg,
           "A1RMGA": self._prepare_ipg_orientation,
@@ -236,6 +270,43 @@ class VantageSimulationDriver(VantageDriver):
     for channel, drops in enumerate(pattern):
       if drops:
         self.tips[channel] = False
+    return 0, ""
+
+  def _move_all_channels_in_y(self, command: str) -> Tuple[int, str]:
+    self.channel_y = positions(parameters(command)["yp"], len(self.tips))
+    return 0, ""
+
+  def _move_all_channels_in_z(self, command: str) -> Tuple[int, str]:
+    self.channel_z = positions(parameters(command)["zp"], len(self.tips))
+    return 0, ""
+
+  def _move_one_channel_in_y(self, command: str) -> Tuple[int, str]:
+    written = parameters(command)
+    channel = int(written["pn"]) - 1
+    if not 0 <= channel < len(self.channel_y):
+      return 32, ""
+    self.channel_y[channel] = int(written["yj"]) / 10
+    return 0, ""
+
+  def _move_one_channel_in_z(self, command: str) -> Tuple[int, str]:
+    written = parameters(command)
+    channel = int(written["pn"]) - 1
+    if not 0 <= channel < len(self.channel_z):
+      return 32, ""
+    self.channel_z[channel] = int(written["zj"]) / 10
+    return 0, ""
+
+  def _move_channels_to_positions(self, command: str) -> Tuple[int, str]:
+    written = parameters(command)
+    pattern = channel_pattern(written["tm"], len(self.tips))
+    xs = positions(written["xp"], len(self.tips))
+    ys = positions(written["yp"], len(self.tips))
+    zs = positions(written["zp"], len(self.tips))
+    for channel, moves in enumerate(pattern):
+      if moves:
+        self.channel_x[channel] = xs[channel]
+        self.channel_y[channel] = ys[channel]
+        self.channel_z[channel] = zs[channel]
     return 0, ""
 
   def _initialize_ipg(self, command: str) -> Tuple[int, str]:

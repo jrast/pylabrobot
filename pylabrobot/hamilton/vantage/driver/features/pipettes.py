@@ -400,6 +400,356 @@ class Pipettes:
       x_shift=config.to_increments(shift),
     )
 
+  # -- positioning ---------------------------------------------------------
+
+  def _check_channel(self, channel: int) -> None:
+    """Raise unless the channel is one the machine has.
+
+    Raises:
+      ValueError: If it is not.
+    """
+    if not 0 <= channel < self.num_channels:
+      raise ValueError(f"channel must be from 0 to {self.num_channels - 1}, but is {channel}")
+
+  def _require_all_channels(self, positions: Dict[int, float], name: str) -> None:
+    """Raise unless every channel has a value, and no key names anything else.
+
+    Raises:
+      ValueError: If a channel is missing, or a key is not one.
+    """
+    missing = [channel for channel in range(self.num_channels) if channel not in positions]
+    if missing:
+      raise ValueError(
+        f"`{name}` must give a value for every one of the {self.num_channels} channels, since the "
+        f"machine moves them all in one command; missing {missing}"
+      )
+    unknown = [channel for channel in positions if not 0 <= channel < self.num_channels]
+    if unknown:
+      raise ValueError(f"`{name}` names channels this machine does not have: {unknown}")
+
+  def _all_positions_in_increments(
+    self, positions: Dict[int, float], name: str, limits: Tuple[float, float]
+  ) -> List[int]:
+    """Every channel's position in wire increments, checked and full width.
+
+    Raises:
+      ValueError: If a channel is missing, a key is not a channel, or a position is out of range.
+    """
+    self._require_all_channels(positions, name)
+    values = [positions[channel] for channel in range(self.num_channels)]
+    _check_range(name, values, limits)
+    return [self.configuration.to_increments(value) for value in values]
+
+  async def move_to_y_positions(self, y_positions: Dict[int, float]) -> None:
+    """Move every channel along Y. Moves the channels.
+
+    The machine takes one position for every channel in one command, and there is no pattern to
+    leave one out, so every channel has to be given: a channel left out would be sent to a
+    position nobody asked for. `move_to_y_position` moves one on its own.
+
+    Args:
+      y_positions: where to put each channel, in mm, keyed by channel, 0-indexed from the back.
+
+    Raises:
+      ValueError: If a channel is missing, a key is not a channel, or a position is out of range.
+    """
+    await self._driver.send_command(
+      module="A1PM",
+      command="DY",
+      yp=self._all_positions_in_increments(y_positions, "y_positions", self.configuration.y_range),
+    )
+
+  async def move_to_z_positions(self, z_positions: Dict[int, float]) -> None:
+    """Move every channel along Z. Moves the channels.
+
+    As `move_to_y_positions`, every channel has to be given.
+
+    Args:
+      z_positions: where to put each channel, in mm, keyed by channel, 0-indexed from the back.
+
+    Raises:
+      ValueError: If a channel is missing, a key is not a channel, or a position is out of range.
+    """
+    await self._driver.send_command(
+      module="A1PM",
+      command="DZ",
+      zp=self._all_positions_in_increments(z_positions, "z_positions", self.configuration.z_range),
+    )
+
+  async def move_to_y_position(self, channel: int, y: float) -> None:
+    """Move one channel along Y. Moves the channel.
+
+    Args:
+      channel: which channel, 0-indexed from the back.
+      y: where to put it, in mm.
+
+    Raises:
+      ValueError: If the channel is not one the machine has, or the position is out of range.
+    """
+    self._check_channel(channel)
+    _check_range("y", [y], self.configuration.y_range)
+    await self._driver.send_command(
+      module="A1PM", command="DV", pn=channel + 1, yj=self.configuration.to_increments(y)
+    )
+
+  async def move_to_z_position(self, channel: int, z: float) -> None:
+    """Move one channel along Z. Moves the channel.
+
+    Args:
+      channel: which channel, 0-indexed from the back.
+      z: where to put it, in mm.
+
+    Raises:
+      ValueError: If the channel is not one the machine has, or the position is out of range.
+    """
+    self._check_channel(channel)
+    _check_range("z", [z], self.configuration.z_range)
+    await self._driver.send_command(
+      module="A1PM", command="DU", pn=channel + 1, zj=self.configuration.to_increments(z)
+    )
+
+  async def move_to_positions(
+    self,
+    xs: Dict[int, float],
+    ys: Dict[int, float],
+    zs: Dict[int, float],
+    *,
+    minimal_traverse_height: Optional[float] = None,
+  ) -> None:
+    """Move the given channels to places of their own. Moves the channels.
+
+    All three axes go in one command, with a pattern that names the channels it is about: the
+    channels it does not name keep their positions and travel nowhere.
+
+    Args:
+      xs: where to put each named channel, along X, in mm.
+      ys: where to put each named channel, along Y, in mm.
+      zs: where to put each named channel, along Z, in mm.
+      minimal_traverse_height: how high the channels travel first, in mm. The configured default
+        when None, and never below what clears the deck.
+
+    Raises:
+      ValueError: If the three do not name the same channels, nothing is named, a channel is not
+        one the machine has, a position is out of range, or the traverse height is.
+    """
+    channels = set(xs) | set(ys) | set(zs)
+    if not channels:
+      raise ValueError("nothing to move: give the places of at least one channel")
+    for name, positions in (("xs", xs), ("ys", ys), ("zs", zs)):
+      if set(positions) != channels:
+        raise ValueError(
+          f"`{name}` must name the same channels as the other axes, "
+          f"{sorted(channels)}, but names {sorted(positions)}"
+        )
+    ordered = sorted(channels)
+    for channel in ordered:
+      self._check_channel(channel)
+
+    config = self.configuration
+    _check_range("xs", [xs[channel] for channel in ordered], config.x_range)
+    _check_range("ys", [ys[channel] for channel in ordered], config.y_range)
+    _check_range("zs", [zs[channel] for channel in ordered], config.z_range)
+    travel = (
+      config.default_minimal_traverse_height
+      if minimal_traverse_height is None
+      else minimal_traverse_height
+    )
+    _check_traverse_height(travel, config)
+
+    await self._driver.send_command(
+      module="A1PM",
+      command="DN",
+      tm=self._tip_pattern(ordered),
+      xp=self._full_width(ordered, [config.to_increments(xs[channel]) for channel in ordered]),
+      yp=self._full_width(ordered, [config.to_increments(ys[channel]) for channel in ordered]),
+      # The height is given for every channel, as the machine takes it, though only the channels
+      # in the pattern move.
+      th=[config.to_increments(travel)] * self.num_channels,
+      zp=self._full_width(ordered, [config.to_increments(zs[channel]) for channel in ordered]),
+    )
+
+  async def expose_channel(self, channel: int) -> None:
+    """Move the channels aside so that one stands exposed, within reach by hand. Moves them.
+
+    Args:
+      channel: which channel to expose, 0-indexed from the back.
+
+    Raises:
+      ValueError: If the channel is not one the machine has.
+    """
+    self._check_channel(channel)
+    await self._driver.send_command(module="A1PM", command="DQ", pn=channel + 1)
+
+  async def request_y_positions(self) -> str:
+    """Ask where every channel stands along Y.
+
+    Returns:
+      The machine's reply as it writes it, which is not read into anything yet.
+    """
+    return await self._driver.send_command(module="A1PM", command="RY")
+
+  async def request_y_position(self, channel: int) -> str:
+    """Ask where one channel stands along Y.
+
+    Args:
+      channel: which channel, 0-indexed from the back.
+
+    Returns:
+      The machine's reply as it writes it, which is not read into anything yet.
+
+    Raises:
+      ValueError: If the channel is not one the machine has.
+    """
+    self._check_channel(channel)
+    return await self._driver.send_command(module="A1PM", command="RB", pn=channel + 1)
+
+  async def request_z_positions(self) -> str:
+    """Ask where every channel stands along Z.
+
+    Returns:
+      The machine's reply as it writes it, which is not read into anything yet.
+    """
+    return await self._driver.send_command(module="A1PM", command="RZ")
+
+  async def request_z_position(self, channel: int) -> str:
+    """Ask where one channel stands along Z.
+
+    Args:
+      channel: which channel, 0-indexed from the back.
+
+    Returns:
+      The machine's reply as it writes it, which is not read into anything yet.
+
+    Raises:
+      ValueError: If the channel is not one the machine has.
+    """
+    self._check_channel(channel)
+    return await self._driver.send_command(module="A1PM", command="RD", pn=channel + 1)
+
+  async def request_height_of_last_lld(self) -> str:
+    """Ask how high the liquid level of the last measurement was.
+
+    Returns:
+      The machine's reply as it writes it, which is not read into anything yet.
+    """
+    return await self._driver.send_command(module="A1PM", command="RL")
+
+  async def request_dispense_on_fly_status(self) -> str:
+    """Ask what the channels report about dispensing on the fly.
+
+    Returns:
+      The machine's reply as it writes it, which is not read into anything yet.
+    """
+    return await self._driver.send_command(module="A1PM", command="QF")
+
+  # -- CoRe gripper tools, as the wire takes them ---------------------------
+
+  async def _unchecked_fw_discard_core_gripper_tool(
+    self,
+    x_position: int,
+    first_tool_y_position: int,
+    tip_types: List[int],
+    begin_z_deposit_positions: List[int],
+    end_z_deposit_positions: List[int],
+    minimal_traverse_heights: List[int],
+    first_channel: int,
+    minimal_heights_at_command_end: List[int],
+  ) -> None:
+    """Discard the CoRe gripper tool each channel carries (`DJ`).
+
+    The positions are in tenths of a millimeter, as the wire takes them, and one value for each
+    channel; nothing is checked here.
+    """
+    await self._driver.send_command(
+      module="A1PM",
+      command="DJ",
+      xa=x_position,
+      yj=first_tool_y_position,
+      tt=tip_types,
+      tp=begin_z_deposit_positions,
+      tz=end_z_deposit_positions,
+      th=minimal_traverse_heights,
+      pa=first_channel,
+      te=minimal_heights_at_command_end,
+    )
+
+  async def _unchecked_fw_grip_core_gripper_plate(
+    self,
+    x_position: int,
+    y_position: int,
+    z_position: int,
+    z_speed: int,
+    open_gripper_position: int,
+    plate_width: int,
+    acceleration_index: int,
+    grip_strength: int,
+    minimal_traverse_heights: List[int],
+    minimal_heights_at_command_end: List[int],
+  ) -> None:
+    """Grip a plate onto the CoRe gripper tools (`DG`), in tenths of a millimeter."""
+    await self._driver.send_command(
+      module="A1PM",
+      command="DG",
+      xa=x_position,
+      yj=y_position,
+      zj=z_position,
+      zy=z_speed,
+      yo=open_gripper_position,
+      yg=plate_width,
+      ai=acceleration_index,
+      yw=grip_strength,
+      th=minimal_traverse_heights,
+      te=minimal_heights_at_command_end,
+    )
+
+  async def _unchecked_fw_put_core_gripper_plate(
+    self,
+    x_position: int,
+    y_position: int,
+    z_position: int,
+    press_on_distance: int,
+    z_speed: int,
+    open_gripper_position: int,
+    minimal_traverse_heights: List[int],
+    minimal_heights_at_command_end: List[int],
+  ) -> None:
+    """Put the plate the CoRe gripper tools carry down (`DR`), in tenths of a millimeter."""
+    await self._driver.send_command(
+      module="A1PM",
+      command="DR",
+      xa=x_position,
+      yj=y_position,
+      zj=z_position,
+      zi=press_on_distance,
+      zy=z_speed,
+      yo=open_gripper_position,
+      th=minimal_traverse_heights,
+      te=minimal_heights_at_command_end,
+    )
+
+  async def _unchecked_fw_move_core_gripper_to_position(
+    self,
+    x_position: int,
+    y_position: int,
+    z_position: int,
+    z_speed: int,
+    minimal_traverse_heights: List[int],
+  ) -> None:
+    """Move the CoRe gripper tools to a place (`DH`), in tenths of a millimeter."""
+    await self._driver.send_command(
+      module="A1PM",
+      command="DH",
+      xa=x_position,
+      yj=y_position,
+      zj=z_position,
+      zy=z_speed,
+      th=minimal_traverse_heights,
+    )
+
+  async def _unchecked_fw_release_core_gripper_object(self, first_channel: int) -> None:
+    """Let go of what the CoRe gripper tools hold (`DO`)."""
+    await self._driver.send_command(module="A1PM", command="DO", pa=first_channel)
+
   # -- tips ----------------------------------------------------------------
 
   async def _unchecked_fw_pick_up_tips(
