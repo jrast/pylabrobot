@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, cast
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 from pylabrobot.hamilton.star.driver.lld_mode import LLDMode
 from pylabrobot.resources.container import Container
@@ -457,6 +457,82 @@ class Pipettes:
     _check_range("the LLD search height", searches, config.z_range)
     return xs, ys, bottoms, surfaces, searches
 
+  def _lld_modes(
+    self, count: int, lld_mode: Union[LLDMode, Sequence[LLDMode], None], *, allowed
+  ) -> List[LLDMode]:
+    """What LLD mode each container uses, checked.
+
+    Args:
+      count: how many containers are given.
+      lld_mode: one mode for all, one for each container, or None for OFF.
+      allowed: the modes this command accepts.
+
+    Returns:
+      One mode for each container.
+
+    Raises:
+      ValueError: If the count does not match, a mode is not accepted, or it is not a mode.
+    """
+    if lld_mode is None:
+      modes = [LLDMode.OFF] * count
+    elif isinstance(lld_mode, LLDMode):
+      modes = [lld_mode] * count
+    else:
+      modes = list(lld_mode)
+    if len(modes) != count:
+      raise ValueError(
+        f"one LLD mode for each of the {count} containers is needed, but {len(modes)} are given"
+      )
+    for mode in modes:
+      if not isinstance(mode, LLDMode):
+        raise ValueError(f"LLD modes must be LLDMode values, not {mode!r}")
+      if mode not in allowed:
+        raise ValueError(
+          f"{mode.name} LLD cannot be used here; the accepted modes are "
+          f"{', '.join(mode.name for mode in allowed)}"
+        )
+    return modes
+
+  async def _correct_trackers_from_lld(
+    self,
+    containers: Sequence[Container],
+    channels: List[int],
+    bottoms: List[float],
+  ) -> None:
+    """Set each container's tracker to what the last LLD search measured, if tracking is on.
+
+    The search may find a surface other than the modelled one, for example when the plate sits a
+    little off. Only a container with height-volume data can be corrected.
+
+    Args:
+      containers: one container for each channel that searched.
+      channels: the channels, in the order of `containers`.
+      bottoms: each container's cavity bottom, in mm on the deck.
+    """
+    if not does_volume_tracking():
+      return
+    heights = await self.request_lld_heights()
+    for container, channel, bottom in zip(containers, channels, bottoms):
+      try:
+        measured = container.compute_volume_from_height(heights[channel] - bottom)
+      except (ValueError, TypeError):
+        logger.warning(
+          "channel %d found a surface in %s that its height-volume data does not cover",
+          channel,
+          container.name,
+        )
+        continue
+      expected = container.tracker.get_used_volume()
+      if expected > 0 and abs(measured - expected) > 0.2 * expected:
+        logger.warning(
+          "channel %d measured %.1f uL in %s where the model had %.1f uL",
+          channel,
+          measured,
+          container.name,
+          expected,
+        )
+      container.tracker.set_volume(measured)
+
   def _book_liquid(
     self, containers: Sequence[Container], volumes: Sequence[float], *, adding: bool
   ) -> List[VolumeTracker]:
@@ -823,6 +899,16 @@ class Pipettes:
       The machine's reply as it writes it, which is not read into anything yet.
     """
     return await self._driver.send_command(module="A1PM", command="RL")
+
+  async def request_lld_heights(self) -> List[float]:
+    """Ask where every channel found the liquid in its last search.
+
+    Returns:
+      One Z position for each channel, in mm on the deck. A channel that has not searched
+      reports 0.
+    """
+    resp = await self._driver.send_command(module="A1PM", command="RL", fmt={"rl": "[int]"})
+    return [value / 10 for value in cast(List[int], resp["rl"])]
 
   async def request_dispense_on_fly_status(self) -> str:
     """Ask what the channels report about dispensing on the fly.
@@ -1272,7 +1358,7 @@ class Pipettes:
     use_channels: Optional[List[int]] = None,
     resource_offsets: Optional[List[Coordinate]] = None,
     liquid_heights: Optional[Sequence[Optional[float]]] = None,
-    lld_mode: Optional[LLDMode] = None,
+    lld_mode: Union[LLDMode, Sequence[LLDMode], None] = None,
     flow_rates: Optional[Sequence[float]] = None,
     *,
     immersion_depths: Optional[Sequence[float]] = None,
@@ -1301,7 +1387,9 @@ class Pipettes:
       use_channels: which channels, 0-indexed from the back. The first `len(containers)` when None.
       resource_offsets: added to each container's centre, in mm. The z shifts the heights.
       liquid_heights: the liquid's height above each cavity bottom, in mm. The bottom when None.
-      lld_mode: `LLDMode.OFF` only, for now. None is OFF.
+      lld_mode: how each channel finds the liquid, one for all or one per container. OFF when
+        None, and then `liquid_heights` says where the surface is; with a mode, the machine
+        searches from above the container and `liquid_heights` must be None.
       flow_rates: how fast each channel draws, in uL/s. 100.0 when None.
       immersion_depths: how far into the liquid each tip goes, in mm. 0.0 when None.
       blow_out_air_volumes: air drawn before the liquid, in uL. 0.0 when None.
@@ -1321,13 +1409,14 @@ class Pipettes:
     Raises:
       RuntimeError: If the driver has no deck.
       ValueError: If the arguments do not come in pairs or a value is out of range.
-      NotImplementedError: If an LLD mode other than OFF is asked for.
+      ValueError: If the LLD mode is not one this command accepts, or `liquid_heights` is given
+        beside one.
     """
-    mode = LLDMode.OFF if lld_mode is None else lld_mode
-    if mode != LLDMode.OFF:
-      raise NotImplementedError(
-        f"the Vantage's {mode.name} LLD is not available yet; use LLDMode.OFF and give "
-        "`liquid_heights`"
+    modes = self._lld_modes(len(containers), lld_mode, allowed=tuple(LLDMode))
+    if liquid_heights is not None and any(mode != LLDMode.OFF for mode in modes):
+      raise ValueError(
+        "`liquid_heights` says where the surface is when LLD is off; with an LLD mode the "
+        "machine searches for it"
       )
     channels = self._channels_for(len(containers), use_channels)
     if len(volumes) != len(channels):
@@ -1412,7 +1501,7 @@ class Pipettes:
       transport_air_volumes=[config.to_increments(volume) for volume in transport],
       blow_out_air_volumes=[round(volume * 100) for volume in blow_out],
       pre_wetting_volumes=[config.to_increments(volume) for volume in pre_wetting],
-      lld_modes=[0] * self.num_channels,
+      lld_modes=self._by_channel("lld_modes", [mode.value for mode in modes], channels, 0),
       clld_sensitivities=[int(value) for value in clld],
       plld_sensitivities=[int(value) for value in plld],
       dual_lld_max_differences=[0] * self.num_channels,
@@ -1439,6 +1528,10 @@ class Pipettes:
       raise
     for tracker in trackers:
       tracker.commit()
+    if any(mode != LLDMode.OFF for mode in modes):
+      await self._correct_trackers_from_lld(
+        containers, channels, [bottoms[channel] for channel in channels]
+      )
 
   async def dispense(
     self,
@@ -1447,7 +1540,7 @@ class Pipettes:
     use_channels: Optional[List[int]] = None,
     resource_offsets: Optional[List[Coordinate]] = None,
     liquid_heights: Optional[Sequence[Optional[float]]] = None,
-    lld_mode: Optional[LLDMode] = None,
+    lld_mode: Union[LLDMode, Sequence[LLDMode], None] = None,
     flow_rates: Optional[Sequence[float]] = None,
     *,
     jet: Optional[Sequence[bool]] = None,
@@ -1477,7 +1570,10 @@ class Pipettes:
       use_channels: which channels, 0-indexed from the back. The first `len(containers)` when None.
       resource_offsets: added to each container's centre, in mm. The z shifts the heights.
       liquid_heights: the liquid's height above each cavity bottom, in mm. The bottom when None.
-      lld_mode: `LLDMode.OFF` only, for now. None is OFF.
+      lld_mode: how each channel finds the liquid, one for all or one per container. OFF when
+        None, and then `liquid_heights` says where the surface is; with a mode, the machine
+        searches from above the container and `liquid_heights` must be None. Dispensing accepts
+        OFF, CAPACITIVE and ZTOUCH.
       flow_rates: how fast each channel gives, in uL/s. 100.0 when None.
       jet: whether each channel gives a jet. False when None.
       blow_out: whether each channel blows out after the liquid. False when None.
@@ -1500,13 +1596,16 @@ class Pipettes:
     Raises:
       RuntimeError: If the driver has no deck.
       ValueError: If the arguments do not come in pairs or a value is out of range.
-      NotImplementedError: If an LLD mode other than OFF is asked for.
+      ValueError: If the LLD mode is not one this command accepts, or `liquid_heights` is given
+        beside one.
     """
-    mode = LLDMode.OFF if lld_mode is None else lld_mode
-    if mode != LLDMode.OFF:
-      raise NotImplementedError(
-        f"the Vantage's {mode.name} LLD is not available yet; use LLDMode.OFF and give "
-        "`liquid_heights`"
+    modes = self._lld_modes(
+      len(containers), lld_mode, allowed=(LLDMode.OFF, LLDMode.CAPACITIVE, LLDMode.ZTOUCH)
+    )
+    if liquid_heights is not None and any(mode != LLDMode.OFF for mode in modes):
+      raise ValueError(
+        "`liquid_heights` says where the surface is when LLD is off; with an LLD mode the "
+        "machine searches for it"
       )
     channels = self._channels_for(len(containers), use_channels)
     if len(volumes) != len(channels):
@@ -1593,7 +1692,7 @@ class Pipettes:
       stop_back_volumes=[config.to_increments(volume) for volume in stop_back],
       transport_air_volumes=[config.to_increments(volume) for volume in transport],
       blow_out_air_volumes=[round(volume * 100) for volume in blow_out_air],
-      lld_modes=[0] * self.num_channels,
+      lld_modes=self._by_channel("lld_modes", [mode.value for mode in modes], channels, 0),
       side_touch_off_distance=config.to_increments(side_touch_off_distance),
       dispense_positions_above_z_touch_off=[5] * self.num_channels,
       clld_sensitivities=[int(value) for value in clld],

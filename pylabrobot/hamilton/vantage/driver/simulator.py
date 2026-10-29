@@ -89,6 +89,7 @@ class VantageSimulationDriver(VantageDriver):
     ipg_installed: bool = True,
     initialized: bool = False,
     ipg_plate: bool = False,
+    liquid_surfaces: Optional[List[float]] = None,
   ):
     """
     Args:
@@ -100,6 +101,8 @@ class VantageSimulationDriver(VantageDriver):
       initialized: whether the arm, the channels and the IPG report themselves already
         initialized, and the IPG parked. A machine that has just been switched on does not.
       ipg_plate: whether the IPG holds a plate.
+      liquid_surfaces: where the liquid surface stands in each channel's container, in mm on the
+        deck, as an LLD search finds it. The deck bottom of every channel when None.
 
     Raises:
       ValueError: If `num_channels` is not positive, `tips_mounted` does not have one entry for
@@ -114,6 +117,11 @@ class VantageSimulationDriver(VantageDriver):
       )
     if ipg_plate and not ipg_installed:
       raise ValueError("a machine without an IPG cannot have a plate in it")
+    if liquid_surfaces is not None and len(liquid_surfaces) != num_channels:
+      raise ValueError(
+        f"liquid_surfaces must have one entry for each of the {num_channels} channels, "
+        f"but has {len(liquid_surfaces)}"
+      )
     super().__init__(io=_UnusedTransport(), deck=deck)
 
     self.has_ipg = ipg_installed
@@ -129,6 +137,11 @@ class VantageSimulationDriver(VantageDriver):
 
     self.ipg_gripper_width: float = 0.0
     """How wide the gripper stands, in mm, after the last grip or put."""
+
+    self.liquid_surfaces: List[float] = (
+      list(liquid_surfaces) if liquid_surfaces is not None else [0.0] * num_channels
+    )
+    """Where each channel's LLD search finds the liquid, in mm on the deck."""
 
     self.ipg_orientation_prepared: bool = False
     """Whether the wrist has been turned to a grip orientation since the IPG was initialized."""
@@ -204,6 +217,10 @@ class VantageSimulationDriver(VantageDriver):
       "A1PMTP": self._pick_up_tips,
       "A1PMTR": self._drop_tips,
       "A1PMDA": self._aspirate,
+      "A1PMRL": lambda command: (
+        0,
+        "rl" + " ".join(str(round(surface * 10)) for surface in self.liquid_surfaces),
+      ),
       "A1PMDD": self._dispense,
     }
     if self.has_ipg:
@@ -227,7 +244,6 @@ class VantageSimulationDriver(VantageDriver):
           "A1PMRB": lambda command: (0, ""),
           "A1PMRZ": lambda command: (0, ""),
           "A1PMRD": lambda command: (0, ""),
-          "A1PMRL": lambda command: (0, ""),
           "A1PMQF": lambda command: (0, ""),
           "A1RMDI": self._initialize_ipg,
           "A1RMGP": self._park_ipg,

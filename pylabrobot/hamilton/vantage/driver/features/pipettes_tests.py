@@ -1117,10 +1117,49 @@ class TestAspirate(AspirateDispenseTestCase):
     finally:
       set_volume_tracking(False)
 
-  async def test_a_non_off_lld_mode_is_refused(self):
-    with self.assertRaises(NotImplementedError):
+  async def test_the_last_lld_heights_are_read_in_mm(self):
+    self.io.answers = lambda command: (
+      [echo(command, "rl" + " ".join(["1000"] * 8))] if command.startswith("A1PMRL") else None
+    )
+    self.assertEqual(await self.pipettes.request_lld_heights(), [100.0] * 8)
+
+  async def test_a_search_sets_the_tracker_to_what_it_found(self):
+    well = self.plate.get_item("A1")
+    bottom = well.get_location_wrt(self.deck, x="c", y="c", z="b").z + well.material_z_thickness
+    original = self.io.answers
+    self.io.answers = lambda command: (
+      [echo(command, "rl" + " ".join([str(round((bottom + 5.0) * 10))] * 8))]
+      if command.startswith("A1PMRL")
+      else original(command)
+    )
+    set_volume_tracking(True)
+    try:
+      well.tracker.set_volume(100.0)
+      await self.pipettes.aspirate([well], [10.0], lld_mode=LLDMode.CAPACITIVE)
+      reported = round((bottom + 5.0) * 10) / 10 - bottom
+      self.assertAlmostEqual(
+        well.tracker.get_used_volume(), well.compute_volume_from_height(reported), places=3
+      )
+    finally:
+      set_volume_tracking(False)
+
+  async def test_a_capacitive_search_is_sent(self):
+    await self.pipettes.aspirate([self.plate.get_item("A1")], [100.0], lld_mode=LLDMode.CAPACITIVE)
+    written = parameters(self.sent()[-1])
+    self.assertEqual(written["lm"].split()[:2], ["1", "0"])
+
+  async def test_a_dual_search_is_sent(self):
+    await self.pipettes.aspirate([self.plate.get_item("A1")], [100.0], lld_mode=LLDMode.DUAL)
+    written = parameters(self.sent()[-1])
+    self.assertEqual(written["lm"].split()[0], "3")
+
+  async def test_a_liquid_height_beside_a_search_is_refused(self):
+    with self.assertRaises(ValueError):
       await self.pipettes.aspirate(
-        [self.plate.get_item("A1")], [100.0], lld_mode=LLDMode.CAPACITIVE
+        [self.plate.get_item("A1")],
+        [100.0],
+        liquid_heights=[5.0],
+        lld_mode=LLDMode.CAPACITIVE,
       )
 
   async def test_one_volume_for_each_channel_is_needed(self):
@@ -1167,5 +1206,14 @@ class TestDispense(AspirateDispenseTestCase):
 
   async def test_pressure_and_dual_lld_are_refused(self):
     for mode in (LLDMode.PRESSURE, LLDMode.DUAL):
-      with self.assertRaises(NotImplementedError):
+      with self.assertRaises(ValueError):
         await self.pipettes.dispense([self.plate.get_item("A1")], [100.0], lld_mode=mode)
+
+  async def test_capacitive_and_z_touch_searches_are_sent(self):
+    await self.pipettes.dispense(
+      [self.plate.get_item("A1"), self.plate.get_item("A2")],
+      [100.0, 100.0],
+      lld_mode=[LLDMode.CAPACITIVE, LLDMode.ZTOUCH],
+    )
+    written = parameters(self.sent()[-1])
+    self.assertEqual(written["lm"].split()[:2], ["1", "4"])
