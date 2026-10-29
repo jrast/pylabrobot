@@ -83,6 +83,9 @@ class Pipettes:
 
   Reached as `driver.pipettes`. The channels are addressed together, so every list a command
   takes holds one value for each channel the machine has.
+
+  Every place these channels move to comes from the deck model, and the driver applies no
+  correction of its own: a place that is wrong is a deck-model bug, fixed where the model is built.
   """
 
   default_x_position: float = 709.5
