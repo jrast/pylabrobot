@@ -9,7 +9,9 @@ from pylabrobot.hamilton.vantage.driver.features.pipettes import (
   _get_dispense_mode,
 )
 from pylabrobot.hamilton.vantage.driver.master import VantageDriver
+from pylabrobot.hamilton.star.driver.lld_mode import LLDMode
 from pylabrobot.hamilton.vantage.driver.master_tests import ScriptedIO, echo, machine
+from pylabrobot.hamilton.vantage.driver.simulator import parameters, positions
 from pylabrobot.legacy.liquid_handling.backends.hamilton.vantage_backend import VantageBackend
 from pylabrobot.resources.coordinate import Coordinate
 from pylabrobot.resources.errors import HasTipError, NoTipError
@@ -1032,3 +1034,99 @@ class TestRawAspirateDispense(PositioningTestCase):
         "gj0gi0 0 0 0 0 0 0 0gk0",
       ],
     )
+
+
+class AspirateDispenseTestCase(PositioningTestCase):
+  """A driver with a deck, a plate on it, and the machine discovered."""
+
+  async def asyncSetUp(self):
+    from pylabrobot.resources.corning.plates import cor_96_wellplate_360uL_Fb
+
+    self.deck = VantageDeck(size=1.3, name="deck")
+    self.plate = cor_96_wellplate_360uL_Fb("plate")
+    self.deck.assign_child_resource(self.plate, location=Coordinate(300, 200, 50))
+    self.io = ScriptedIO(machine())
+    self.driver = VantageDriver(self.io, deck=self.deck, read_timeout=5)
+    self.driver._connected = True
+    self.driver._router.start()
+    await self.driver.discover()
+    self.io.written.clear()
+    pipettes = self.driver.pipettes
+    assert pipettes is not None
+    self.pipettes = pipettes
+
+
+class TestAspirate(AspirateDispenseTestCase):
+  """Drawing liquid from containers in mm and uL."""
+
+  async def test_the_volumes_and_speeds_are_converted(self):
+    await self.pipettes.aspirate(
+      [self.plate.get_item("A1"), self.plate.get_item("A2")],
+      [100.0, 50.0],
+      liquid_heights=[5.0, 5.0],
+    )
+    command = self.sent()[-1]
+    self.assertTrue(command.startswith("A1PMDA"))
+    written = parameters(command)
+    self.assertEqual(written["av"].split(), ["10000", "5000"] + ["0"] * 6)
+    self.assertEqual(written["as"].split(), ["1000"] * 8)
+
+  async def test_the_liquid_surface_is_the_bottom_plus_the_height(self):
+    await self.pipettes.aspirate(
+      [self.plate.get_item("A1"), self.plate.get_item("A2")],
+      [100.0, 50.0],
+      liquid_heights=[5.0, 5.0],
+    )
+    written = parameters(self.sent()[-1])
+    for surface, bottom in zip(written["zl"].split()[:2], written["zx"].split()[:2]):
+      self.assertEqual(int(surface) - int(bottom), 50)
+
+  async def test_the_places_come_from_the_deck_model(self):
+    await self.pipettes.aspirate([self.plate.get_item("A1")], [100.0], liquid_heights=[5.0])
+    written = parameters(self.sent()[-1])
+    a1 = self.plate.get_item("A1").get_location_wrt(self.deck, x="c", y="c", z="b")
+    self.assertEqual(positions(written["xp"], 8)[0], round(a1.x, 1))
+    self.assertEqual(positions(written["yp"], 8)[0], round(a1.y, 1))
+
+  async def test_a_non_off_lld_mode_is_refused(self):
+    with self.assertRaises(NotImplementedError):
+      await self.pipettes.aspirate(
+        [self.plate.get_item("A1")], [100.0], lld_mode=LLDMode.CAPACITIVE
+      )
+
+  async def test_one_volume_for_each_channel_is_needed(self):
+    with self.assertRaises(ValueError):
+      await self.pipettes.aspirate([self.plate.get_item("A1")], [100.0, 50.0])
+
+  async def test_a_volume_above_the_channels_capacity_is_refused(self):
+    with self.assertRaises(ValueError):
+      await self.pipettes.aspirate([self.plate.get_item("A1")], [1250.1])
+
+
+class TestDispense(AspirateDispenseTestCase):
+  """Giving liquid into containers in mm and uL."""
+
+  async def test_the_volumes_and_speeds_are_converted(self):
+    await self.pipettes.dispense([self.plate.get_item("A1")], [100.0], liquid_heights=[5.0])
+    command = self.sent()[-1]
+    self.assertTrue(command.startswith("A1PMDD"))
+    written = parameters(command)
+    self.assertEqual(written["dv"].split(), ["10000"] + ["0000"] * 7)
+    self.assertEqual(written["ds"].split(), ["1000"] * 8)
+    self.assertEqual(written["ss"].split(), ["50"] * 8)
+
+  async def test_the_mode_comes_from_jet_empty_and_blow_out(self):
+    await self.pipettes.dispense(
+      [self.plate.get_item("A1"), self.plate.get_item("A2")],
+      [100.0, 100.0],
+      jet=[True, False],
+      empty=[False, False],
+      blow_out=[True, True],
+    )
+    written = parameters(self.sent()[-1])
+    self.assertEqual(written["dm"].split()[:2], ["1", "3"])
+
+  async def test_pressure_and_dual_lld_are_refused(self):
+    for mode in (LLDMode.PRESSURE, LLDMode.DUAL):
+      with self.assertRaises(NotImplementedError):
+        await self.pipettes.dispense([self.plate.get_item("A1")], [100.0], lld_mode=mode)
