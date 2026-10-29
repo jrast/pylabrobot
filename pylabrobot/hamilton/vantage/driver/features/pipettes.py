@@ -866,6 +866,7 @@ class Pipettes:
     lld_modes: List[int],
     clld_sensitivities: List[int],
     plld_sensitivities: List[int],
+    dual_lld_max_differences: List[int],
     aspirate_positions_above_z_touch_off: List[int],
     swap_speeds: List[int],
     settling_times: List[int],
@@ -874,7 +875,7 @@ class Pipettes:
     mix_positions_from_liquid_surface: List[int],
     mix_speeds: List[int],
     mix_surface_following_distances: List[int],
-    use_2nd_sections: List[bool],
+    adc_algorithms: List[bool],
     capacitive_mad_supervisions: List[bool],
     pressure_mad_supervisions: List[bool],
     tadm_algorithm: bool,
@@ -911,15 +912,18 @@ class Pipettes:
       lld_modes: how each channel finds the liquid, 0 off to 4 (`lm`).
       clld_sensitivities: capacitive LLD sensitivity, 1 high to 4 low (`ll`).
       plld_sensitivities: pressure LLD sensitivity, 1 high to 4 low (`lv`).
+      dual_lld_max_differences: the most the capacitive and pressure LLD positions may differ in
+        a dual search (`ld`).
       aspirate_positions_above_z_touch_off: where a channel draws above a Z touch-off (`zo`).
       swap_speeds: how fast each channel leaves the liquid (`de`).
       settling_times: how long each channel waits after drawing (`wt`).
       mix_volumes: what each channel mixes with (`mv`).
       mix_cycles: how many times each channel mixes (`mc`).
-      mix_positions_from_liquid_surface: where each channel mixes (`mp`).
+      mix_positions_from_liquid_surface: where each channel mixes, from its actual position
+        (`mp`).
       mix_speeds: how fast each channel mixes (`ms`).
       mix_surface_following_distances: how far each channel follows during mixing (`mh`).
-      use_2nd_sections: whether each channel uses the second section (`la`).
+      adc_algorithms: whether each channel uses the ADC algorithm (`la`).
       capacitive_mad_supervisions: whether capacitive MAD supervision is on (`lb`).
       pressure_mad_supervisions: whether pressure MAD supervision is on (`lc`).
       tadm_algorithm: whether the TADM algorithm is on (`gj`).
@@ -952,6 +956,7 @@ class Pipettes:
       lm=lld_modes,
       ll=clld_sensitivities,
       lv=plld_sensitivities,
+      ld=dual_lld_max_differences,
       zo=aspirate_positions_above_z_touch_off,
       de=swap_speeds,
       wt=settling_times,
@@ -960,7 +965,7 @@ class Pipettes:
       mp=mix_positions_from_liquid_surface,
       ms=mix_speeds,
       mh=mix_surface_following_distances,
-      la=use_2nd_sections,
+      la=adc_algorithms,
       lb=capacitive_mad_supervisions,
       lc=pressure_mad_supervisions,
       gj=tadm_algorithm,
@@ -1002,7 +1007,7 @@ class Pipettes:
     mix_positions_from_liquid_surface: List[int],
     mix_speeds: List[int],
     mix_surface_following_distances: List[int],
-    use_2nd_sections: List[bool],
+    adc_algorithms: List[bool],
     tadm_algorithm: bool,
     limit_curve_indices: List[int],
     recording_mode: int,
@@ -1043,10 +1048,11 @@ class Pipettes:
       settling_times: how long each channel waits after dispensing (`wt`).
       mix_volumes: what each channel mixes with (`mv`).
       mix_cycles: how many times each channel mixes (`mc`).
-      mix_positions_from_liquid_surface: where each channel mixes (`mp`).
+      mix_positions_from_liquid_surface: where each channel mixes, from its actual position
+        (`mp`).
       mix_speeds: how fast each channel mixes (`ms`).
       mix_surface_following_distances: how far each channel follows during mixing (`mh`).
-      use_2nd_sections: whether each channel uses the second section (`la`).
+      adc_algorithms: whether each channel uses the ADC algorithm (`la`).
       tadm_algorithm: whether the TADM algorithm is on (`gj`).
       limit_curve_indices: which limit curve each channel uses (`gi`).
       recording_mode: 0 none, 1 TADM errors, 2 all TADM measurements (`gk`).
@@ -1087,7 +1093,7 @@ class Pipettes:
       mp=mix_positions_from_liquid_surface,
       ms=mix_speeds,
       mh=mix_surface_following_distances,
-      la=use_2nd_sections,
+      la=adc_algorithms,
       gj=tadm_algorithm,
       gi=limit_curve_indices,
       gk=recording_mode,

@@ -939,6 +939,7 @@ class TestRawAspirateDispense(PositioningTestCase):
       lld_modes=self.eight(1),
       clld_sensitivities=self.eight(1),
       plld_sensitivities=self.eight(1),
+      dual_lld_max_differences=self.eight(0),
       aspirate_positions_above_z_touch_off=self.eight(5),
       swap_speeds=self.eight(100),
       settling_times=self.eight(5),
@@ -947,7 +948,7 @@ class TestRawAspirateDispense(PositioningTestCase):
       mix_positions_from_liquid_surface=self.eight(250),
       mix_speeds=self.eight(500),
       mix_surface_following_distances=self.eight(0),
-      use_2nd_sections=[False] * 8,
+      adc_algorithms=[False] * 8,
       capacitive_mad_supervisions=[False] * 8,
       pressure_mad_supervisions=[False] * 8,
       tadm_algorithm=False,
@@ -965,7 +966,7 @@ class TestRawAspirateDispense(PositioningTestCase):
         "ip0 0 0 0 0 0 0 0fp0 0 0 0 0 0 0 0av100 100 100 100 100 100 100 100"
         "as500 500 500 500 500 500 500 500ta0 0 0 0 0 0 0 0ba0 0 0 0 0 0 0 0"
         "oa0 0 0 0 0 0 0 0lm1 1 1 1 1 1 1 1ll1 1 1 1 1 1 1 1lv1 1 1 1 1 1 1 1"
-        "zo5 5 5 5 5 5 5 5de100 100 100 100 100 100 100 100wt5 5 5 5 5 5 5 5"
+        "ld0 0 0 0 0 0 0 0zo5 5 5 5 5 5 5 5de100 100 100 100 100 100 100 100wt5 5 5 5 5 5 5 5"
         "mv0 0 0 0 0 0 0 0mc0 0 0 0 0 0 0 0mp250 250 250 250 250 250 250 250"
         "ms500 500 500 500 500 500 500 500mh0 0 0 0 0 0 0 0la0 0 0 0 0 0 0 0"
         "lb0 0 0 0 0 0 0 0lc0 0 0 0 0 0 0 0gj0gi0 0 0 0 0 0 0 0gk0"
@@ -1006,7 +1007,7 @@ class TestRawAspirateDispense(PositioningTestCase):
       mix_positions_from_liquid_surface=self.eight(250),
       mix_speeds=self.eight(500),
       mix_surface_following_distances=self.eight(0),
-      use_2nd_sections=[False] * 8,
+      adc_algorithms=[False] * 8,
       tadm_algorithm=False,
       limit_curve_indices=self.eight(0),
       recording_mode=0,
