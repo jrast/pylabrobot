@@ -78,6 +78,29 @@ def _check_range(name: str, values: List[float], limits: Tuple[float, float]) ->
       raise ValueError(f"{name} must be from {low} to {high}, but is {value}")
 
 
+def _get_dispense_mode(jet: bool, empty: bool, blow_out: bool) -> int:
+  """The dispense mode (`dm`) for a jet, an empty and a blow-out.
+
+  The firmware's names and the VENUS liquid editor's differ: what the editor calls "empty" is a
+  blow-out, while the firmware's "empty" (4) empties the tip completely. A blow-out at the surface
+  is the mode used when neither a jet nor an empty is asked for.
+
+  Args:
+    jet: whether the liquid leaves as a jet, as opposed to standing at the surface.
+    empty: whether to empty the tip completely.
+    blow_out: whether to blow out after the liquid.
+
+  Returns:
+    The firmware's mode: 0 part in jet, 1 blow in jet, 2 part at surface, 3 blow at surface,
+    4 empty.
+  """
+  if empty:
+    return 4
+  if jet:
+    return 1 if blow_out else 0
+  return 3 if blow_out else 2
+
+
 class Pipettes:
   """The pipetting channels.
 
@@ -814,6 +837,260 @@ class Pipettes:
       tm=tip_pattern,
       ts=0,
       td=dispose_method,
+    )
+
+  # -- aspiration and dispensing -------------------------------------------
+
+  async def _unchecked_fw_aspirate(
+    self,
+    aspiration_type: List[int],
+    tip_pattern: List[bool],
+    x_positions: List[int],
+    y_positions: List[int],
+    minimum_traverse_height_start: List[int],
+    minimum_z_end_position: List[int],
+    lld_search_heights: List[int],
+    clot_detection_heights: List[int],
+    liquid_surfaces_no_lld: List[int],
+    pull_out_distances_transport_air: List[int],
+    second_section_heights: List[int],
+    second_section_ratios: List[int],
+    minimum_heights: List[int],
+    immersion_depths: List[int],
+    surface_following_distances: List[int],
+    aspiration_volumes: List[int],
+    aspiration_speeds: List[int],
+    transport_air_volumes: List[int],
+    blow_out_air_volumes: List[int],
+    pre_wetting_volumes: List[int],
+    lld_modes: List[int],
+    clld_sensitivities: List[int],
+    plld_sensitivities: List[int],
+    aspirate_positions_above_z_touch_off: List[int],
+    swap_speeds: List[int],
+    settling_times: List[int],
+    mix_volumes: List[int],
+    mix_cycles: List[int],
+    mix_positions_from_liquid_surface: List[int],
+    mix_speeds: List[int],
+    mix_surface_following_distances: List[int],
+    use_2nd_sections: List[bool],
+    capacitive_mad_supervisions: List[bool],
+    pressure_mad_supervisions: List[bool],
+    tadm_algorithm: bool,
+    limit_curve_indices: List[int],
+    recording_mode: int,
+  ) -> None:
+    """Send an aspiration as it goes on the wire (`A1PM DA`), with every value checked by nothing.
+
+    Every list holds one value for each channel of the machine, and every value is already in the
+    unit the wire carries: tenths of a mm, hundredths of a uL for a volume, tenths for a speed in
+    uL/s. `PipettesConfiguration` converts from mm, uL and uL/s.
+
+    Args:
+      aspiration_type: 0 simple, 1 sequence, 2 cup emptied (`at`).
+      tip_pattern: which channels take part (`tm`).
+      x_positions: where each channel goes, along X (`xp`).
+      y_positions: where each channel goes, along Y (`yp`).
+      minimum_traverse_height_start: how high the channels travel first (`th`).
+      minimum_z_end_position: how high they end (`te`).
+      lld_search_heights: where each channel starts searching for the liquid (`lp`).
+      clot_detection_heights: how far below the surface a clot is looked for (`ch`).
+      liquid_surfaces_no_lld: the surface each channel uses when LLD is off (`zl`).
+      pull_out_distances_transport_air: how far a channel pulls out to take transport air (`po`).
+      second_section_heights: the second section's height, measured from the Z reference (`zu`).
+      second_section_ratios: the second section's ratio, in ten-thousandths (`zr`).
+      minimum_heights: the lowest each channel may go (`zx`).
+      immersion_depths: how far into the liquid each tip goes, negative being out of it (`ip`).
+      surface_following_distances: how far each channel follows the surface (`fp`).
+      aspiration_volumes: what each channel draws (`av`).
+      aspiration_speeds: how fast (`as`).
+      transport_air_volumes: transport air drawn per channel (`ta`).
+      blow_out_air_volumes: air blown out per channel (`ba`).
+      pre_wetting_volumes: drawn and returned before the aspiration (`oa`).
+      lld_modes: how each channel finds the liquid, 0 off to 4 (`lm`).
+      clld_sensitivities: capacitive LLD sensitivity, 1 high to 4 low (`ll`).
+      plld_sensitivities: pressure LLD sensitivity, 1 high to 4 low (`lv`).
+      aspirate_positions_above_z_touch_off: where a channel draws above a Z touch-off (`zo`).
+      swap_speeds: how fast each channel leaves the liquid (`de`).
+      settling_times: how long each channel waits after drawing (`wt`).
+      mix_volumes: what each channel mixes with (`mv`).
+      mix_cycles: how many times each channel mixes (`mc`).
+      mix_positions_from_liquid_surface: where each channel mixes (`mp`).
+      mix_speeds: how fast each channel mixes (`ms`).
+      mix_surface_following_distances: how far each channel follows during mixing (`mh`).
+      use_2nd_sections: whether each channel uses the second section (`la`).
+      capacitive_mad_supervisions: whether capacitive MAD supervision is on (`lb`).
+      pressure_mad_supervisions: whether pressure MAD supervision is on (`lc`).
+      tadm_algorithm: whether the TADM algorithm is on (`gj`).
+      limit_curve_indices: which limit curve each channel uses (`gi`).
+      recording_mode: 0 none, 1 TADM errors, 2 all TADM measurements (`gk`).
+    """
+    await self._driver.send_command(
+      module="A1PM",
+      command="DA",
+      at=aspiration_type,
+      tm=tip_pattern,
+      xp=x_positions,
+      yp=y_positions,
+      th=minimum_traverse_height_start,
+      te=minimum_z_end_position,
+      lp=lld_search_heights,
+      ch=clot_detection_heights,
+      zl=liquid_surfaces_no_lld,
+      po=pull_out_distances_transport_air,
+      zu=second_section_heights,
+      zr=second_section_ratios,
+      zx=minimum_heights,
+      ip=immersion_depths,
+      fp=surface_following_distances,
+      av=aspiration_volumes,
+      as_=aspiration_speeds,
+      ta=transport_air_volumes,
+      ba=blow_out_air_volumes,
+      oa=pre_wetting_volumes,
+      lm=lld_modes,
+      ll=clld_sensitivities,
+      lv=plld_sensitivities,
+      zo=aspirate_positions_above_z_touch_off,
+      de=swap_speeds,
+      wt=settling_times,
+      mv=mix_volumes,
+      mc=mix_cycles,
+      mp=mix_positions_from_liquid_surface,
+      ms=mix_speeds,
+      mh=mix_surface_following_distances,
+      la=use_2nd_sections,
+      lb=capacitive_mad_supervisions,
+      lc=pressure_mad_supervisions,
+      gj=tadm_algorithm,
+      gi=limit_curve_indices,
+      gk=recording_mode,
+    )
+
+  async def _unchecked_fw_dispense(
+    self,
+    dispense_mode: List[int],
+    tip_pattern: List[bool],
+    x_positions: List[int],
+    y_positions: List[int],
+    minimum_heights: List[int],
+    lld_search_heights: List[int],
+    liquid_surfaces_no_lld: List[int],
+    pull_out_distances_transport_air: List[int],
+    immersion_depths: List[int],
+    surface_following_distances: List[int],
+    second_section_heights: List[int],
+    second_section_ratios: List[int],
+    minimum_traverse_height_start: List[int],
+    minimum_z_end_position: List[int],
+    dispense_volumes: List[int],
+    dispense_speeds: List[int],
+    cut_off_speeds: List[int],
+    stop_back_volumes: List[int],
+    transport_air_volumes: List[int],
+    blow_out_air_volumes: List[int],
+    lld_modes: List[int],
+    side_touch_off_distance: int,
+    dispense_positions_above_z_touch_off: List[int],
+    clld_sensitivities: List[int],
+    plld_sensitivities: List[int],
+    swap_speeds: List[int],
+    settling_times: List[int],
+    mix_volumes: List[int],
+    mix_cycles: List[int],
+    mix_positions_from_liquid_surface: List[int],
+    mix_speeds: List[int],
+    mix_surface_following_distances: List[int],
+    use_2nd_sections: List[bool],
+    tadm_algorithm: bool,
+    limit_curve_indices: List[int],
+    recording_mode: int,
+  ) -> None:
+    """Send a dispense as it goes on the wire (`A1PM DD`), with every value checked by nothing.
+
+    Every list holds one value for each channel of the machine, and every value is already in the
+    unit the wire carries: tenths of a mm, hundredths of a uL for a volume, tenths for a speed in
+    uL/s. `PipettesConfiguration` converts from mm, uL and uL/s.
+
+    Args:
+      dispense_mode: the mode from `_get_dispense_mode` (`dm`).
+      tip_pattern: which channels take part (`tm`).
+      x_positions: where each channel goes, along X (`xp`).
+      y_positions: where each channel goes, along Y (`yp`).
+      minimum_heights: the lowest each channel may go (`zx`).
+      lld_search_heights: where each channel starts searching for the liquid (`lp`).
+      liquid_surfaces_no_lld: the surface each channel uses when LLD is off (`zl`).
+      pull_out_distances_transport_air: how far a channel pulls out to take transport air (`po`).
+      immersion_depths: how far into the liquid each tip goes, negative being out of it (`ip`).
+      surface_following_distances: how far each channel follows the surface (`fp`).
+      second_section_heights: the second section's height, measured from the Z reference (`zu`).
+      second_section_ratios: the second section's ratio, in ten-thousandths (`zr`).
+      minimum_traverse_height_start: how high the channels travel first (`th`).
+      minimum_z_end_position: how high they end (`te`).
+      dispense_volumes: what each channel gives (`dv`).
+      dispense_speeds: how fast (`ds`).
+      cut_off_speeds: the speed each channel cuts off at (`ss`).
+      stop_back_volumes: how much each channel stops back (`rv`).
+      transport_air_volumes: transport air drawn per channel (`ta`).
+      blow_out_air_volumes: air blown out per channel (`ba`).
+      lld_modes: how each channel finds the liquid, 0 off to 4 (`lm`).
+      side_touch_off_distance: how far a channel touches off to the side (`dj`).
+      dispense_positions_above_z_touch_off: where a channel dispenses above a Z touch-off (`zo`).
+      clld_sensitivities: capacitive LLD sensitivity, 1 high to 4 low (`ll`).
+      plld_sensitivities: pressure LLD sensitivity, 1 high to 4 low (`lv`).
+      swap_speeds: how fast each channel leaves the liquid (`de`).
+      settling_times: how long each channel waits after dispensing (`wt`).
+      mix_volumes: what each channel mixes with (`mv`).
+      mix_cycles: how many times each channel mixes (`mc`).
+      mix_positions_from_liquid_surface: where each channel mixes (`mp`).
+      mix_speeds: how fast each channel mixes (`ms`).
+      mix_surface_following_distances: how far each channel follows during mixing (`mh`).
+      use_2nd_sections: whether each channel uses the second section (`la`).
+      tadm_algorithm: whether the TADM algorithm is on (`gj`).
+      limit_curve_indices: which limit curve each channel uses (`gi`).
+      recording_mode: 0 none, 1 TADM errors, 2 all TADM measurements (`gk`).
+    """
+    await self._driver.send_command(
+      module="A1PM",
+      command="DD",
+      dm=dispense_mode,
+      tm=tip_pattern,
+      xp=x_positions,
+      yp=y_positions,
+      zx=minimum_heights,
+      lp=lld_search_heights,
+      zl=liquid_surfaces_no_lld,
+      po=pull_out_distances_transport_air,
+      ip=immersion_depths,
+      fp=surface_following_distances,
+      zu=second_section_heights,
+      zr=second_section_ratios,
+      th=minimum_traverse_height_start,
+      te=minimum_z_end_position,
+      # At least four digits, as the machine takes the volume: a shorter number is read wrong.
+      dv=[f"{volume:04}" for volume in dispense_volumes],
+      ds=dispense_speeds,
+      ss=cut_off_speeds,
+      rv=stop_back_volumes,
+      ta=transport_air_volumes,
+      ba=blow_out_air_volumes,
+      lm=lld_modes,
+      dj=side_touch_off_distance,
+      zo=dispense_positions_above_z_touch_off,
+      ll=clld_sensitivities,
+      lv=plld_sensitivities,
+      de=swap_speeds,
+      wt=settling_times,
+      mv=mix_volumes,
+      mc=mix_cycles,
+      mp=mix_positions_from_liquid_surface,
+      ms=mix_speeds,
+      mh=mix_surface_following_distances,
+      la=use_2nd_sections,
+      gj=tadm_algorithm,
+      gi=limit_curve_indices,
+      gk=recording_mode,
     )
 
   async def pick_up_tips(

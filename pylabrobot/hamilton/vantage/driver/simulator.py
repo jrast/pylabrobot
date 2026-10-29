@@ -203,6 +203,8 @@ class VantageSimulationDriver(VantageDriver):
       "A1PMDI": self._initialize_channels,
       "A1PMTP": self._pick_up_tips,
       "A1PMTR": self._drop_tips,
+      "A1PMDA": self._aspirate,
+      "A1PMDD": self._dispense,
     }
     if self.has_ipg:
       handlers.update(
@@ -270,6 +272,34 @@ class VantageSimulationDriver(VantageDriver):
     for channel, drops in enumerate(pattern):
       if drops:
         self.tips[channel] = False
+    return 0, ""
+
+  def _aspirate(self, command: str) -> Tuple[int, str]:
+    """Take what the command says, and put each channel where it says along X and Y.
+
+    The depth a channel draws at is not modelled: a draw from a well is the same as a draw in the
+    air to everything this simulator keeps.
+    """
+    written = parameters(command)
+    pattern = channel_pattern(written["tm"], len(self.tips))
+    xs = positions(written["xp"], len(self.tips))
+    ys = positions(written["yp"], len(self.tips))
+    for channel, moves in enumerate(pattern):
+      if moves:
+        self.channel_x[channel] = xs[channel]
+        self.channel_y[channel] = ys[channel]
+    return 0, ""
+
+  def _dispense(self, command: str) -> Tuple[int, str]:
+    """Give what the command says, and put each channel where it says along X and Y."""
+    written = parameters(command)
+    pattern = channel_pattern(written["tm"], len(self.tips))
+    xs = positions(written["xp"], len(self.tips))
+    ys = positions(written["yp"], len(self.tips))
+    for channel, moves in enumerate(pattern):
+      if moves:
+        self.channel_x[channel] = xs[channel]
+        self.channel_y[channel] = ys[channel]
     return 0, ""
 
   def _move_all_channels_in_y(self, command: str) -> Tuple[int, str]:
