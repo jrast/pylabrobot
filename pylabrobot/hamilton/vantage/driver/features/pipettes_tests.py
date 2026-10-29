@@ -14,13 +14,14 @@ from pylabrobot.hamilton.vantage.driver.master_tests import ScriptedIO, echo, ma
 from pylabrobot.hamilton.vantage.driver.simulator import parameters, positions
 from pylabrobot.legacy.liquid_handling.backends.hamilton.vantage_backend import VantageBackend
 from pylabrobot.resources.coordinate import Coordinate
-from pylabrobot.resources.errors import HasTipError, NoTipError
+from pylabrobot.resources.errors import HasTipError, NoTipError, TooLittleLiquidError
 from pylabrobot.resources.hamilton.tip_carriers import hamilton_tip_carrier_L5
 from pylabrobot.resources.hamilton.tip_creators import HamiltonTip, TipPickupMethod
 from pylabrobot.resources.hamilton.tip_racks import hamilton_96_tiprack_300uL
 from pylabrobot.resources.hamilton.vantage_decks import VantageDeck
 from pylabrobot.resources.tip_rack import TipRack
 from pylabrobot.resources.tip_tracking import set_tip_tracking
+from pylabrobot.resources.volume_tracker import set_volume_tracking
 
 PIPETTES_LOGGER = "pylabrobot.hamilton.vantage.driver.features.pipettes"
 
@@ -1088,6 +1089,34 @@ class TestAspirate(AspirateDispenseTestCase):
     self.assertEqual(positions(written["xp"], 8)[0], round(a1.x, 1))
     self.assertEqual(positions(written["yp"], 8)[0], round(a1.y, 1))
 
+  async def test_the_lld_search_height_is_above_the_well(self):
+    await self.pipettes.aspirate([self.plate.get_item("A1")], [100.0], liquid_heights=[5.0])
+    written = parameters(self.sent()[-1])
+    well = self.plate.get_item("A1")
+    expected = round(well.get_absolute_size_z() * 10) + 17
+    self.assertEqual(int(written["lp"].split()[0]) - int(written["zx"].split()[0]), expected)
+
+  async def test_aspiration_is_booked_in_the_container(self):
+    set_volume_tracking(True)
+    try:
+      well = self.plate.get_item("A1")
+      well.tracker.set_volume(100.0)
+      await self.pipettes.aspirate([well], [40.0])
+      self.assertAlmostEqual(well.tracker.get_used_volume(), 60.0)
+    finally:
+      set_volume_tracking(False)
+
+  async def test_aspirating_more_than_the_container_holds_is_refused(self):
+    set_volume_tracking(True)
+    try:
+      well = self.plate.get_item("A1")
+      well.tracker.set_volume(10.0)
+      with self.assertRaises(TooLittleLiquidError):
+        await self.pipettes.aspirate([well], [40.0])
+      self.assertEqual(self.sent(), [])
+    finally:
+      set_volume_tracking(False)
+
   async def test_a_non_off_lld_mode_is_refused(self):
     with self.assertRaises(NotImplementedError):
       await self.pipettes.aspirate(
@@ -1125,6 +1154,16 @@ class TestDispense(AspirateDispenseTestCase):
     )
     written = parameters(self.sent()[-1])
     self.assertEqual(written["dm"].split()[:2], ["1", "3"])
+
+  async def test_dispensing_is_booked_in_the_container(self):
+    set_volume_tracking(True)
+    try:
+      well = self.plate.get_item("A1")
+      well.tracker.set_volume(10.0)
+      await self.pipettes.dispense([well], [5.0])
+      self.assertAlmostEqual(well.tracker.get_used_volume(), 15.0)
+    finally:
+      set_volume_tracking(False)
 
   async def test_pressure_and_dual_lld_are_refused(self):
     for mode in (LLDMode.PRESSURE, LLDMode.DUAL):

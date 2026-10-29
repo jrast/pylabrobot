@@ -10,6 +10,8 @@ from pylabrobot.resources.coordinate import Coordinate
 from pylabrobot.resources.errors import HasTipError, NoTipError
 from pylabrobot.resources.hamilton.tip_creators import HamiltonTip
 from pylabrobot.resources.tip_rack import TipSpot
+from pylabrobot.resources.volume_tracker import VolumeTracker, does_volume_tracking
+from pylabrobot.resources.well import Well
 
 if TYPE_CHECKING:
   from pylabrobot.hamilton.vantage.driver.master import VantageDriver
@@ -396,8 +398,9 @@ class Pipettes:
     containers: Sequence[Container],
     offsets: Optional[Sequence[Coordinate]],
     liquid_heights: Optional[Sequence[Optional[float]]],
-  ) -> Tuple[List[float], List[float], List[float], List[float]]:
-    """Where each channel goes, and the liquid surface there, in mm on the deck.
+  ) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
+    """Where each channel goes, the liquid surface there, and where to search for it, in mm on
+    the deck.
 
     The place comes from the deck model: the container's centre, its outer bottom raised by the
     material between that bottom and the cavity, and the liquid surface at the given height above
@@ -410,7 +413,8 @@ class Pipettes:
         and None for each entry means the same.
 
     Returns:
-      X, Y, the cavity bottom and the liquid surface, one for each container.
+      X, Y, the cavity bottom, the liquid surface and the LLD search height, one for each
+      container.
 
     Raises:
       RuntimeError: If the driver has no deck.
@@ -435,6 +439,7 @@ class Pipettes:
     ys: List[float] = []
     bottoms: List[float] = []
     surfaces: List[float] = []
+    searches: List[float] = []
     for container, offset, height in zip(containers, offsets, liquid_heights):
       location = container.get_location_wrt(deck, x="c", y="c", z="b") + offset
       bottom = location.z + container.material_z_thickness
@@ -442,11 +447,56 @@ class Pipettes:
       ys.append(location.y)
       bottoms.append(bottom)
       surfaces.append(bottom + (height or 0.0))
+      # A well is searched for just above its rim, any other container 5 mm above its top.
+      clearance = 1.7 if isinstance(container, Well) else 5.0
+      searches.append(bottom + container.get_absolute_size_z() + clearance)
     _check_range("x", xs, config.x_range)
     _check_range("y", ys, config.y_range)
     _check_range("the cavity bottom", bottoms, config.z_range)
     _check_range("the liquid surface", surfaces, config.z_range)
-    return xs, ys, bottoms, surfaces
+    _check_range("the LLD search height", searches, config.z_range)
+    return xs, ys, bottoms, surfaces, searches
+
+  def _book_liquid(
+    self, containers: Sequence[Container], volumes: Sequence[float], *, adding: bool
+  ) -> List[VolumeTracker]:
+    """Book what a command will move in the containers' trackers, pending its success.
+
+    Nothing is booked when volume tracking is off. Every container is checked before any is
+    booked, so a refusal leaves the model as it was.
+
+    Args:
+      containers: one container for each volume.
+      volumes: what each container gains or gives, in uL.
+      adding: whether the liquid is given to the containers, as opposed to drawn from them.
+
+    Returns:
+      The trackers, to commit on success or roll back on failure.
+
+    Raises:
+      TooLittleLiquidError: If a container does not hold what is drawn from it.
+      TooLittleVolumeError: If a container cannot hold what is given to it.
+    """
+    if not does_volume_tracking():
+      return []
+    trackers: List[VolumeTracker] = []
+    try:
+      for container, volume in zip(containers, volumes):
+        if adding:
+          container.tracker.validate_add_liquid(volume)
+        else:
+          container.tracker.validate_remove_liquid(volume)
+      for container, volume in zip(containers, volumes):
+        trackers.append(container.tracker)
+        if adding:
+          container.tracker.add_liquid(volume)
+        else:
+          container.tracker.remove_liquid(volume)
+    except BaseException:
+      for tracker in reversed(trackers):
+        tracker.rollback()
+      raise
+    return trackers
 
   def _default_y_positions(self) -> List[float]:
     """Where each channel discards by default.
@@ -1287,7 +1337,9 @@ class Pipettes:
       )
     _check_range("volumes", list(volumes), (0.0, 1250.0))
     config = self.configuration
-    xs, ys, bottoms, surfaces = self._container_places(containers, resource_offsets, liquid_heights)
+    xs, ys, bottoms, surfaces, searches = self._container_places(
+      containers, resource_offsets, liquid_heights
+    )
     start = (
       config.default_minimal_traverse_height
       if minimum_traverse_height_start is None
@@ -1335,16 +1387,18 @@ class Pipettes:
     ys = self._by_channel("y_positions", ys, channels, 0.0)
     bottoms = self._by_channel("the cavity bottom", bottoms, channels, 0.0)
     surfaces = self._by_channel("the liquid surface", surfaces, channels, 0.0)
+    searches = self._by_channel("the LLD search height", searches, channels, 0.0)
     drawn = self._by_channel("volumes", list(volumes), channels, 0.0)
 
-    await self._unchecked_fw_aspirate(
+    trackers = self._book_liquid(containers, volumes, adding=False)
+    command = self._unchecked_fw_aspirate(
       aspiration_type=[0] * self.num_channels,
       tip_pattern=self._tip_pattern(channels),
       x_positions=self._increments(xs),
       y_positions=self._increments(ys),
       minimum_traverse_height_start=[config.to_increments(start)] * self.num_channels,
       minimum_z_end_position=[config.to_increments(end)] * self.num_channels,
-      lld_search_heights=[0] * self.num_channels,
+      lld_search_heights=self._increments(searches),
       clot_detection_heights=self._increments(clots),
       liquid_surfaces_no_lld=self._increments(surfaces),
       pull_out_distances_transport_air=self._increments(pull_out),
@@ -1377,6 +1431,14 @@ class Pipettes:
       limit_curve_indices=[0] * self.num_channels,
       recording_mode=0,
     )
+    try:
+      await command
+    except BaseException:
+      for tracker in trackers:
+        tracker.rollback()
+      raise
+    for tracker in trackers:
+      tracker.commit()
 
   async def dispense(
     self,
@@ -1454,7 +1516,9 @@ class Pipettes:
       )
     _check_range("volumes", list(volumes), (0.0, 1250.0))
     config = self.configuration
-    xs, ys, bottoms, surfaces = self._container_places(containers, resource_offsets, liquid_heights)
+    xs, ys, bottoms, surfaces, searches = self._container_places(
+      containers, resource_offsets, liquid_heights
+    )
     start = (
       config.default_minimal_traverse_height
       if minimum_traverse_height_start is None
@@ -1502,9 +1566,11 @@ class Pipettes:
     ys = self._by_channel("y_positions", ys, channels, 0.0)
     bottoms = self._by_channel("the cavity bottom", bottoms, channels, 0.0)
     surfaces = self._by_channel("the liquid surface", surfaces, channels, 0.0)
+    searches = self._by_channel("the LLD search height", searches, channels, 0.0)
     given = self._by_channel("volumes", list(volumes), channels, 0.0)
 
-    await self._unchecked_fw_dispense(
+    trackers = self._book_liquid(containers, volumes, adding=True)
+    command = self._unchecked_fw_dispense(
       dispense_mode=[
         _get_dispense_mode(bool(j), bool(e), bool(b)) for j, e, b in zip(jets, empties, blows)
       ],
@@ -1512,7 +1578,7 @@ class Pipettes:
       x_positions=self._increments(xs),
       y_positions=self._increments(ys),
       minimum_heights=self._increments(bottoms),
-      lld_search_heights=[0] * self.num_channels,
+      lld_search_heights=self._increments(searches),
       liquid_surfaces_no_lld=self._increments(surfaces),
       pull_out_distances_transport_air=[config.to_increments(10.0)] * self.num_channels,
       immersion_depths=self._increments(immersion),
@@ -1544,6 +1610,14 @@ class Pipettes:
       limit_curve_indices=[0] * self.num_channels,
       recording_mode=0,
     )
+    try:
+      await command
+    except BaseException:
+      for tracker in trackers:
+        tracker.rollback()
+      raise
+    for tracker in trackers:
+      tracker.commit()
 
   async def pick_up_tips(
     self,
