@@ -1116,7 +1116,6 @@ class Pipettes:
     lld_modes: List[int],
     clld_sensitivities: List[int],
     plld_sensitivities: List[int],
-    dual_lld_max_differences: List[int],
     aspirate_positions_above_z_touch_off: List[int],
     swap_speeds: List[int],
     settling_times: List[int],
@@ -1162,8 +1161,6 @@ class Pipettes:
       lld_modes: how each channel finds the liquid, 0 off to 4 (`lm`).
       clld_sensitivities: capacitive LLD sensitivity, 1 high to 4 low (`ll`).
       plld_sensitivities: pressure LLD sensitivity, 1 high to 4 low (`lv`).
-      dual_lld_max_differences: the most the capacitive and pressure LLD positions may differ in
-        a dual search (`ld`).
       aspirate_positions_above_z_touch_off: where a channel draws above a Z touch-off (`zo`).
       swap_speeds: how fast each channel leaves the liquid (`de`).
       settling_times: how long each channel waits after drawing (`wt`).
@@ -1206,7 +1203,6 @@ class Pipettes:
       lm=lld_modes,
       ll=clld_sensitivities,
       lv=plld_sensitivities,
-      ld=dual_lld_max_differences,
       zo=aspirate_positions_above_z_touch_off,
       de=swap_speeds,
       wt=settling_times,
@@ -1504,7 +1500,6 @@ class Pipettes:
       lld_modes=self._by_channel("lld_modes", [mode.value for mode in modes], channels, 0),
       clld_sensitivities=[int(value) for value in clld],
       plld_sensitivities=[int(value) for value in plld],
-      dual_lld_max_differences=[0] * self.num_channels,
       aspirate_positions_above_z_touch_off=[5] * self.num_channels,
       swap_speeds=[config.to_increments(speed) for speed in swaps],
       settling_times=[round(value * 10) for value in settle],
