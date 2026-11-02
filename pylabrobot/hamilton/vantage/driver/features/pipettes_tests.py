@@ -589,3 +589,294 @@ class TestDropTips(TipsTestCase):
     with self.assertRaises(HasTipError):
       await self.pipettes.drop_tips(self.spots[:1], use_channels=[1])
     self.assertEqual(self.io.written, [])
+
+
+class PositioningTestCase(PipettesTestCase):
+  """A driver on a machine with eight channels, discovered, sending no ids in its tests."""
+
+  def sent(self) -> List[str]:
+    return [without_id(command) for command in self.io.written]
+
+
+class TestPositioningMoves(PositioningTestCase):
+  """Moving the channels, all of them or one at a time."""
+
+  async def test_every_channel_moves_along_y(self):
+    await self.pipettes.move_to_y_positions({channel: 100.0 + channel for channel in range(8)})
+    self.assertEqual(self.sent(), ["A1PMDYyp1000 1010 1020 1030 1040 1050 1060 1070"])
+
+  async def test_every_channel_move_matches_the_legacy_command(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.position_all_channels_in_y_direction(y_position=[100, 200, 300, 400, 500])
+    await self.pipettes.move_to_y_positions(
+      {0: 10.0, 1: 20.0, 2: 30.0, 3: 40.0, 4: 50.0, 5: 60.0, 6: 70.0, 7: 80.0}
+    )
+    self.assertEqual(self.sent()[-1][:6], "A1PMDY")
+    self.assertEqual(self.sent()[-1].split("yp")[1].split()[0], "100")
+    self.assertEqual(without_id(catcher.commands[-1])[:6], "A1PMDY")
+
+  async def test_every_channel_moves_along_z(self):
+    await self.pipettes.move_to_z_positions({channel: 10.0 * channel for channel in range(8)})
+    self.assertEqual(self.sent(), ["A1PMDZzp0 100 200 300 400 500 600 700"])
+
+  async def test_one_channel_moves_along_y(self):
+    await self.pipettes.move_to_y_position(channel=2, y=123.4)
+    self.assertEqual(self.sent(), ["A1PMDVpn3yj1234"])
+
+  async def test_one_channel_move_matches_the_legacy_command(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.position_single_channel_in_y_direction(channel_index=3, y_position=1234)
+    await self.pipettes.move_to_y_position(channel=2, y=123.4)
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+  async def test_one_channel_moves_along_z(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.position_single_channel_in_z_direction(channel_index=5, z_position=2500)
+    await self.pipettes.move_to_z_position(channel=4, z=250.0)
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+    self.assertEqual(self.sent()[-1], "A1PMDUpn5zj2500")
+
+  async def test_a_place_for_each_channel_of_the_pattern(self):
+    await self.pipettes.move_to_positions(
+      {1: 100.0, 3: 200.0}, {1: 300.0, 3: 400.0}, {1: 50.0, 3: 60.0}
+    )
+    self.assertEqual(
+      self.sent(),
+      [
+        "A1PMDNtm0 1 0 1 0 0 0 0xp0 1000 0 2000 0 0 0 0yp0 3000 0 4000 0 0 0 0"
+        "th2450 2450 2450 2450 2450 2450 2450 2450zp0 500 0 600 0 0 0 0"
+      ],
+    )
+
+  async def test_a_place_matches_the_legacy_command(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.move_to_defined_position(
+      x_position=[0, 1000, 0, 2000, 0, 0, 0, 0],
+      y_position=[0, 3000, 0, 4000, 0, 0, 0, 0],
+      tip_pattern=[False, True, False, True, False, False, False, False],
+      minimal_traverse_height_at_begin_of_command=[2450] * 8,
+      z_position=[0, 500, 0, 600, 0, 0, 0, 0],
+    )
+    await self.pipettes.move_to_positions(
+      {1: 100.0, 3: 200.0}, {1: 300.0, 3: 400.0}, {1: 50.0, 3: 60.0}
+    )
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+  async def test_the_travel_height_can_be_given(self):
+    await self.pipettes.move_to_positions(
+      {0: 1.0}, {0: 2.0}, {0: 3.0}, minimal_traverse_height=300.0
+    )
+    self.assertIn("th3000", self.sent()[-1])
+
+  async def test_the_axes_must_name_the_same_channels(self):
+    with self.assertRaises(ValueError):
+      await self.pipettes.move_to_positions({0: 1.0}, {0: 2.0, 1: 3.0}, {0: 4.0})
+    self.assertEqual(self.sent(), [])
+
+  async def test_nothing_is_moved_when_no_channel_is_named(self):
+    with self.assertRaises(ValueError):
+      await self.pipettes.move_to_positions({}, {}, {})
+    self.assertEqual(self.sent(), [])
+
+  async def test_a_channel_is_exposed(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.expose_channel_n(channel_index=4)
+    await self.pipettes.expose_channel(channel=3)
+    self.assertEqual(self.sent(), ["A1PMDQpn4"])
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+  async def test_a_channel_the_machine_has_not_is_refused(self):
+    for move in (
+      lambda: self.pipettes.move_to_y_position(channel=8, y=10.0),
+      lambda: self.pipettes.move_to_z_position(channel=-1, z=10.0),
+      lambda: self.pipettes.expose_channel(channel=8),
+    ):
+      with self.assertRaises(ValueError):
+        await move()
+    self.assertEqual(self.sent(), [])
+
+  async def test_a_position_out_of_reach_is_refused(self):
+    refused = [
+      lambda: self.pipettes.move_to_y_positions({channel: 650.1 for channel in range(8)}),
+      lambda: self.pipettes.move_to_z_positions({channel: -0.1 for channel in range(8)}),
+      lambda: self.pipettes.move_to_positions({0: 5000.1}, {0: 1.0}, {0: 1.0}),
+      lambda: self.pipettes.move_to_positions({0: 1.0}, {0: 650.1}, {0: 1.0}),
+      lambda: self.pipettes.move_to_positions({0: 1.0}, {0: 1.0}, {0: 360.1}),
+    ]
+    for move in refused:
+      with self.assertRaises(ValueError):
+        await move()
+    self.assertEqual(self.sent(), [])
+
+  async def test_a_travel_height_below_the_deck_is_refused(self):
+    with self.assertRaises(ValueError):
+      await self.pipettes.move_to_positions(
+        {0: 1.0}, {0: 1.0}, {0: 1.0}, minimal_traverse_height=200.0
+      )
+    self.assertEqual(self.sent(), [])
+
+  async def test_every_channel_of_an_all_channel_move_is_required(self):
+    with self.assertRaises(ValueError) as caught:
+      await self.pipettes.move_to_y_positions({0: 10.0})
+    self.assertIn("[1, 2, 3, 4, 5, 6, 7]", str(caught.exception))
+    with self.assertRaises(ValueError):
+      await self.pipettes.move_to_z_positions({channel: 10.0 for channel in range(8)} | {8: 1.0})
+    self.assertEqual(self.sent(), [])
+
+
+class TestPositionQueries(PositioningTestCase):
+  """Where the channels stand, whose replies are not read yet."""
+
+  async def test_y_positions(self):
+    self.io.answers = lambda command: [echo(command, "yp100 200")]
+    reply = await self.pipettes.request_y_positions()
+    self.assertEqual(self.sent(), ["A1PMRY"])
+    self.assertIn("er0yp100 200", reply)
+
+  async def test_y_position_of_one_channel(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.request_y_position_of_channel_n(channel_index=3)
+    reply = await self.pipettes.request_y_position(channel=2)
+    self.assertEqual(self.sent(), ["A1PMRBpn3"])
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+    self.assertIn("A1PMRBid", reply)
+
+  async def test_z_positions(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.request_z_positions_of_all_channels()
+    await self.pipettes.request_z_positions()
+    self.assertEqual(self.sent(), ["A1PMRZ"])
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+  async def test_z_position_of_one_channel(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.request_z_position_of_channel_n(channel_index=5)
+    await self.pipettes.request_z_position(channel=4)
+    self.assertEqual(self.sent(), ["A1PMRDpn5"])
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+  async def test_the_height_of_the_last_lld(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.request_height_of_last_lld()
+    await self.pipettes.request_height_of_last_lld()
+    self.assertEqual(self.sent(), ["A1PMRL"])
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+  async def test_the_dispense_on_fly_status(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.request_channel_dispense_on_fly_status()
+    await self.pipettes.request_dispense_on_fly_status()
+    self.assertEqual(self.sent(), ["A1PMQF"])
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+  async def test_a_channel_the_machine_has_not_is_refused(self):
+    with self.assertRaises(ValueError):
+      await self.pipettes.request_y_position(channel=8)
+    with self.assertRaises(ValueError):
+      await self.pipettes.request_z_position(channel=-1)
+    self.assertEqual(self.sent(), [])
+
+
+class TestCoreGripperCommands(PositioningTestCase):
+  """The CoRe gripper tool commands, written as the wire takes them."""
+
+  async def test_discarding_a_tool(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.discard_core_gripper_tool(
+      gripper_tool_x_position=100,
+      first_gripper_tool_y_pos=200,
+      tip_type=[14] * 8,
+      begin_z_deposit_position=[0] * 8,
+      end_z_deposit_position=[100] * 8,
+      minimal_traverse_height_at_begin_of_command=[2450] * 8,
+      first_pip_channel_node_no=1,
+      minimal_height_at_command_end=[2450] * 8,
+    )
+    await self.pipettes._unchecked_fw_discard_core_gripper_tool(
+      x_position=100,
+      first_tool_y_position=200,
+      tip_types=[14] * 8,
+      begin_z_deposit_positions=[0] * 8,
+      end_z_deposit_positions=[100] * 8,
+      minimal_traverse_heights=[2450] * 8,
+      first_channel=1,
+      minimal_heights_at_command_end=[2450] * 8,
+    )
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+  async def test_gripping_a_plate(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.grip_plate(
+      plate_center_x_direction=100,
+      plate_center_y_direction=200,
+      plate_center_z_direction=300,
+      z_speed=1287,
+      open_gripper_position=860,
+      plate_width=800,
+      acceleration_index=4,
+      grip_strength=30,
+      minimal_traverse_height_at_begin_of_command=[2450] * 8,
+      minimal_height_at_command_end=[2450] * 8,
+    )
+    await self.pipettes._unchecked_fw_grip_core_gripper_plate(
+      x_position=100,
+      y_position=200,
+      z_position=300,
+      z_speed=1287,
+      open_gripper_position=860,
+      plate_width=800,
+      acceleration_index=4,
+      grip_strength=30,
+      minimal_traverse_heights=[2450] * 8,
+      minimal_heights_at_command_end=[2450] * 8,
+    )
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+  async def test_putting_a_plate(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.put_plate(
+      plate_center_x_direction=100,
+      plate_center_y_direction=200,
+      plate_center_z_direction=300,
+      press_on_distance=5,
+      z_speed=1287,
+      open_gripper_position=860,
+      minimal_traverse_height_at_begin_of_command=[2450] * 8,
+      minimal_height_at_command_end=[2450] * 8,
+    )
+    await self.pipettes._unchecked_fw_put_core_gripper_plate(
+      x_position=100,
+      y_position=200,
+      z_position=300,
+      press_on_distance=5,
+      z_speed=1287,
+      open_gripper_position=860,
+      minimal_traverse_heights=[2450] * 8,
+      minimal_heights_at_command_end=[2450] * 8,
+    )
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+  async def test_moving_to_a_position(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.move_to_position(
+      plate_center_x_direction=100,
+      plate_center_y_direction=200,
+      plate_center_z_direction=300,
+      z_speed=1287,
+      minimal_traverse_height_at_begin_of_command=[2450] * 8,
+    )
+    await self.pipettes._unchecked_fw_move_core_gripper_to_position(
+      x_position=100,
+      y_position=200,
+      z_position=300,
+      z_speed=1287,
+      minimal_traverse_heights=[2450] * 8,
+    )
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+  async def test_releasing_an_object(self):
+    catcher = LegacyCatcher(num_channels=8)
+    await catcher.release_object(first_pip_channel_node_no=3)
+    await self.pipettes._unchecked_fw_release_core_gripper_object(first_channel=3)
+    self.assertEqual(self.sent(), ["A1PMDOpa3"])
+    self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))

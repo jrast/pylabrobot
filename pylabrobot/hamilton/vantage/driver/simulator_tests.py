@@ -253,6 +253,55 @@ class TestIpgPlates(unittest.IsolatedAsyncioTestCase):
       await self.ipg.grip_plate(100.0, 200.0, 50.0, plate_width=127.8)
 
 
+class TestPositioning(unittest.IsolatedAsyncioTestCase):
+  """Moving the channels, against the simulated machine."""
+
+  async def asyncSetUp(self):
+    self.driver = VantageSimulationDriver()
+    await self.driver.setup()
+    pipettes = self.driver.pipettes
+    assert pipettes is not None
+    self.pipettes = pipettes
+
+  async def asyncTearDown(self):
+    await self.driver.stop()
+
+  async def test_every_channel_moves_along_y(self):
+    await self.pipettes.move_to_y_positions({channel: 100.0 + channel for channel in range(8)})
+    self.assertEqual(self.driver.channel_y, [100.0 + channel for channel in range(8)])
+
+  async def test_every_channel_moves_along_z(self):
+    await self.pipettes.move_to_z_positions({channel: 10.0 * channel for channel in range(8)})
+    self.assertEqual(self.driver.channel_z, [10.0 * channel for channel in range(8)])
+
+  async def test_one_channel_moves_along_y(self):
+    await self.pipettes.move_to_y_position(2, 123.4)
+    self.assertEqual(self.driver.channel_y[2], 123.4)
+    self.assertEqual(self.driver.channel_y[:2] + self.driver.channel_y[3:], [0.0] * 7)
+
+  async def test_one_channel_moves_along_z(self):
+    await self.pipettes.move_to_z_position(4, 250.0)
+    self.assertEqual(self.driver.channel_z[4], 250.0)
+
+  async def test_only_the_channels_the_pattern_names_move(self):
+    await self.pipettes.move_to_positions(
+      {1: 10.0, 3: 20.0}, {1: 30.0, 3: 40.0}, {1: 50.0, 3: 60.0}
+    )
+    self.assertEqual(self.driver.channel_x, [0.0, 10.0, 0.0, 20.0, 0.0, 0.0, 0.0, 0.0])
+    self.assertEqual(self.driver.channel_y, [0.0, 30.0, 0.0, 40.0, 0.0, 0.0, 0.0, 0.0])
+    self.assertEqual(self.driver.channel_z, [0.0, 50.0, 0.0, 60.0, 0.0, 0.0, 0.0, 0.0])
+
+  async def test_a_repeated_list_reaches_every_channel(self):
+    await self.driver.send_raw_command("A1PMDYid0001yp2000&")
+    self.assertEqual(self.driver.channel_y, [200.0] * 8)
+
+  async def test_the_queries_are_answered(self):
+    self.assertIn("A1PMRYid", await self.pipettes.request_y_positions())
+    self.assertIn("A1PMRZid", await self.pipettes.request_z_positions())
+    self.assertIn("A1PMRBid", await self.pipettes.request_y_position(3))
+    self.assertIn("A1PMRLid", await self.pipettes.request_height_of_last_lld())
+
+
 if __name__ == "__main__":
   unittest.main()
 

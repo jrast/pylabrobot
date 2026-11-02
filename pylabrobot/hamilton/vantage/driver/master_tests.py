@@ -138,6 +138,26 @@ def machine(
       return [echo(command, error=0 if arm_up[0] else 16)]
     if module_and_command in ("A1RMQR", "A1RMQI"):
       return [echo(command)]
+    if module_and_command in (
+      "A1PMDY",
+      "A1PMDZ",
+      "A1PMDV",
+      "A1PMDU",
+      "A1PMDN",
+      "A1PMDQ",
+      "A1PMRY",
+      "A1PMRB",
+      "A1PMRZ",
+      "A1PMRD",
+      "A1PMRL",
+      "A1PMQF",
+      "A1PMDJ",
+      "A1PMDG",
+      "A1PMDR",
+      "A1PMDH",
+      "A1PMDO",
+    ):
+      return [echo(command)]
     return None
 
   return answers
