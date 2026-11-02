@@ -341,3 +341,17 @@ class TestTips(unittest.IsolatedAsyncioTestCase):
   async def test_a_pattern_that_repeats_the_last_value_reaches_every_channel(self):
     await self.driver.send_raw_command("A1PMTPid0001tm1&")
     self.assertEqual(self.driver.tips, [True] * 8)
+
+
+class TestLld(unittest.IsolatedAsyncioTestCase):
+  """What a search finds, as the simulated machine reports it."""
+
+  async def test_the_last_lld_heights_are_the_simulated_surfaces(self):
+    driver = VantageSimulationDriver(liquid_surfaces=[100.0] * 8)
+    await driver.setup()
+    assert driver.pipettes is not None
+    self.assertEqual(await driver.pipettes.request_lld_heights(), [100.0] * 8)
+
+  def test_a_surface_for_each_channel_is_needed(self):
+    with self.assertRaises(ValueError):
+      VantageSimulationDriver(liquid_surfaces=[100.0])

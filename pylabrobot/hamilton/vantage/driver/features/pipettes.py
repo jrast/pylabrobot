@@ -2,12 +2,16 @@
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, cast
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union, cast
 
+from pylabrobot.hamilton.star.driver.lld_mode import LLDMode
+from pylabrobot.resources.container import Container
 from pylabrobot.resources.coordinate import Coordinate
 from pylabrobot.resources.errors import HasTipError, NoTipError
 from pylabrobot.resources.hamilton.tip_creators import HamiltonTip
 from pylabrobot.resources.tip_rack import TipSpot
+from pylabrobot.resources.volume_tracker import VolumeTracker, does_volume_tracking
+from pylabrobot.resources.well import Well
 
 if TYPE_CHECKING:
   from pylabrobot.hamilton.vantage.driver.master import VantageDriver
@@ -76,6 +80,29 @@ def _check_range(name: str, values: List[float], limits: Tuple[float, float]) ->
   for value in values:
     if not low <= value <= high:
       raise ValueError(f"{name} must be from {low} to {high}, but is {value}")
+
+
+def _get_dispense_mode(jet: bool, empty: bool, blow_out: bool) -> int:
+  """The dispense mode (`dm`) for a jet, an empty and a blow-out.
+
+  The firmware's names and the VENUS liquid editor's differ: what the editor calls "empty" is a
+  blow-out, while the firmware's "empty" (4) empties the tip completely. A blow-out at the surface
+  is the mode used when neither a jet nor an empty is asked for.
+
+  Args:
+    jet: whether the liquid leaves as a jet, as opposed to standing at the surface.
+    empty: whether to empty the tip completely.
+    blow_out: whether to blow out after the liquid.
+
+  Returns:
+    The firmware's mode: 0 part in jet, 1 blow in jet, 2 part at surface, 3 blow at surface,
+    4 empty.
+  """
+  if empty:
+    return 4
+  if jet:
+    return 1 if blow_out else 0
+  return 3 if blow_out else 2
 
 
 class Pipettes:
@@ -310,6 +337,242 @@ class Pipettes:
         f"but holds {len(values)}"
       )
     return list(values)
+
+  def _increments(self, values: Sequence[float]) -> List[int]:
+    """Values in mm as the wire carries them, in tenths of a mm."""
+    return [self.configuration.to_increments(value) for value in values]
+
+  def _by_channel(
+    self,
+    name: str,
+    values: Optional[Sequence],
+    channels: List[int],
+    default,
+  ) -> List:
+    """One value for each channel of the machine, from one value for each channel given.
+
+    Args:
+      name: what the values are, for the error message.
+      values: one value for each channel in `channels`, or None for the default everywhere.
+      channels: the channels the values are for, ascending.
+      default: what the other channels get.
+
+    Raises:
+      ValueError: If `values` does not hold one value for each channel given.
+    """
+    full = [default] * self.num_channels
+    if values is None:
+      return full
+    if len(values) != len(channels):
+      raise ValueError(
+        f"{name} must hold one value for each of the {len(channels)} channels, "
+        f"but holds {len(values)}"
+      )
+    for channel, value in zip(channels, values):
+      full[channel] = value
+    return full
+
+  def _channels_for(self, count: int, use_channels: Optional[List[int]]) -> List[int]:
+    """Which channels take part, checked.
+
+    Args:
+      count: how many containers are given.
+      use_channels: which channels, 0-indexed from the back. The first `count` when None.
+
+    Raises:
+      ValueError: If there is not one channel per container, or a channel is not one the machine
+        has.
+    """
+    channels = list(range(count)) if use_channels is None else list(use_channels)
+    if len(channels) != count:
+      raise ValueError(
+        f"one channel for each container is needed, but {count} containers and "
+        f"{len(channels)} channels are given"
+      )
+    for channel in channels:
+      self._check_channel(channel)
+    return channels
+
+  def _container_places(
+    self,
+    containers: Sequence[Container],
+    offsets: Optional[Sequence[Coordinate]],
+    liquid_heights: Optional[Sequence[Optional[float]]],
+  ) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
+    """Where each channel goes, the liquid surface there, and where to search for it, in mm on
+    the deck.
+
+    The place comes from the deck model: the container's centre, its outer bottom raised by the
+    material between that bottom and the cavity, and the liquid surface at the given height above
+    the cavity bottom. The driver adds no correction of its own.
+
+    Args:
+      containers: one container for each channel, in channel order.
+      offsets: added to each container's centre, in mm. None for none.
+      liquid_heights: the liquid's height above each cavity bottom, in mm. None means the bottom,
+        and None for each entry means the same.
+
+    Returns:
+      X, Y, the cavity bottom, the liquid surface and the LLD search height, one for each
+      container.
+
+    Raises:
+      RuntimeError: If the driver has no deck.
+      ValueError: If there is not one offset and one height for each container, or a place is out
+        of reach.
+    """
+    deck = self._driver.deck
+    if deck is None:
+      raise RuntimeError("containers are placed from the deck; this driver was given none")
+    n = len(containers)
+    if offsets is None:
+      offsets = [Coordinate.zero()] * n
+    elif len(offsets) != n:
+      raise ValueError(f"resource_offsets must hold one offset for each of {n} containers")
+    if liquid_heights is None:
+      liquid_heights = [None] * n
+    elif len(liquid_heights) != n:
+      raise ValueError(f"liquid_heights must hold one value for each of {n} containers")
+
+    config = self.configuration
+    xs: List[float] = []
+    ys: List[float] = []
+    bottoms: List[float] = []
+    surfaces: List[float] = []
+    searches: List[float] = []
+    for container, offset, height in zip(containers, offsets, liquid_heights):
+      location = container.get_location_wrt(deck, x="c", y="c", z="b") + offset
+      bottom = location.z + container.material_z_thickness
+      xs.append(location.x)
+      ys.append(location.y)
+      bottoms.append(bottom)
+      surfaces.append(bottom + (height or 0.0))
+      # A well is searched for just above its rim, any other container 5 mm above its top.
+      clearance = 1.7 if isinstance(container, Well) else 5.0
+      searches.append(bottom + container.get_absolute_size_z() + clearance)
+    _check_range("x", xs, config.x_range)
+    _check_range("y", ys, config.y_range)
+    _check_range("the cavity bottom", bottoms, config.z_range)
+    _check_range("the liquid surface", surfaces, config.z_range)
+    _check_range("the LLD search height", searches, config.z_range)
+    return xs, ys, bottoms, surfaces, searches
+
+  def _lld_modes(
+    self, count: int, lld_mode: Union[LLDMode, Sequence[LLDMode], None], *, allowed
+  ) -> List[LLDMode]:
+    """What LLD mode each container uses, checked.
+
+    Args:
+      count: how many containers are given.
+      lld_mode: one mode for all, one for each container, or None for OFF.
+      allowed: the modes this command accepts.
+
+    Returns:
+      One mode for each container.
+
+    Raises:
+      ValueError: If the count does not match, a mode is not accepted, or it is not a mode.
+    """
+    if lld_mode is None:
+      modes = [LLDMode.OFF] * count
+    elif isinstance(lld_mode, LLDMode):
+      modes = [lld_mode] * count
+    else:
+      modes = list(lld_mode)
+    if len(modes) != count:
+      raise ValueError(
+        f"one LLD mode for each of the {count} containers is needed, but {len(modes)} are given"
+      )
+    for mode in modes:
+      if not isinstance(mode, LLDMode):
+        raise ValueError(f"LLD modes must be LLDMode values, not {mode!r}")
+      if mode not in allowed:
+        raise ValueError(
+          f"{mode.name} LLD cannot be used here; the accepted modes are "
+          f"{', '.join(mode.name for mode in allowed)}"
+        )
+    return modes
+
+  async def _correct_trackers_from_lld(
+    self,
+    containers: Sequence[Container],
+    channels: List[int],
+    bottoms: List[float],
+  ) -> None:
+    """Set each container's tracker to what the last LLD search measured, if tracking is on.
+
+    The search may find a surface other than the modelled one, for example when the plate sits a
+    little off. Only a container with height-volume data can be corrected.
+
+    Args:
+      containers: one container for each channel that searched.
+      channels: the channels, in the order of `containers`.
+      bottoms: each container's cavity bottom, in mm on the deck.
+    """
+    if not does_volume_tracking():
+      return
+    heights = await self.request_lld_heights()
+    for container, channel, bottom in zip(containers, channels, bottoms):
+      try:
+        measured = container.compute_volume_from_height(heights[channel] - bottom)
+      except (ValueError, TypeError):
+        logger.warning(
+          "channel %d found a surface in %s that its height-volume data does not cover",
+          channel,
+          container.name,
+        )
+        continue
+      expected = container.tracker.get_used_volume()
+      if expected > 0 and abs(measured - expected) > 0.2 * expected:
+        logger.warning(
+          "channel %d measured %.1f uL in %s where the model had %.1f uL",
+          channel,
+          measured,
+          container.name,
+          expected,
+        )
+      container.tracker.set_volume(measured)
+
+  def _book_liquid(
+    self, containers: Sequence[Container], volumes: Sequence[float], *, adding: bool
+  ) -> List[VolumeTracker]:
+    """Book what a command will move in the containers' trackers, pending its success.
+
+    Nothing is booked when volume tracking is off. Every container is checked before any is
+    booked, so a refusal leaves the model as it was.
+
+    Args:
+      containers: one container for each volume.
+      volumes: what each container gains or gives, in uL.
+      adding: whether the liquid is given to the containers, as opposed to drawn from them.
+
+    Returns:
+      The trackers, to commit on success or roll back on failure.
+
+    Raises:
+      TooLittleLiquidError: If a container does not hold what is drawn from it.
+      TooLittleVolumeError: If a container cannot hold what is given to it.
+    """
+    if not does_volume_tracking():
+      return []
+    trackers: List[VolumeTracker] = []
+    try:
+      for container, volume in zip(containers, volumes):
+        if adding:
+          container.tracker.validate_add_liquid(volume)
+        else:
+          container.tracker.validate_remove_liquid(volume)
+      for container, volume in zip(containers, volumes):
+        trackers.append(container.tracker)
+        if adding:
+          container.tracker.add_liquid(volume)
+        else:
+          container.tracker.remove_liquid(volume)
+    except BaseException:
+      for tracker in reversed(trackers):
+        tracker.rollback()
+      raise
+    return trackers
 
   def _default_y_positions(self) -> List[float]:
     """Where each channel discards by default.
@@ -637,6 +900,16 @@ class Pipettes:
     """
     return await self._driver.send_command(module="A1PM", command="RL")
 
+  async def request_lld_heights(self) -> List[float]:
+    """Ask where every channel found the liquid in its last search.
+
+    Returns:
+      One Z position for each channel, in mm on the deck. A channel that has not searched
+      reports 0.
+    """
+    resp = await self._driver.send_command(module="A1PM", command="RL", fmt={"rl": "[int]"})
+    return [value / 10 for value in cast(List[int], resp["rl"])]
+
   async def request_dispense_on_fly_status(self) -> str:
     """Ask what the channels report about dispensing on the fly.
 
@@ -815,6 +1088,630 @@ class Pipettes:
       ts=0,
       td=dispose_method,
     )
+
+  # -- aspiration and dispensing -------------------------------------------
+
+  async def _unchecked_fw_aspirate(
+    self,
+    aspiration_type: List[int],
+    tip_pattern: List[bool],
+    x_positions: List[int],
+    y_positions: List[int],
+    minimum_traverse_height_start: List[int],
+    minimum_z_end_position: List[int],
+    lld_search_heights: List[int],
+    clot_detection_heights: List[int],
+    liquid_surfaces_no_lld: List[int],
+    pull_out_distances_transport_air: List[int],
+    second_section_heights: List[int],
+    second_section_ratios: List[int],
+    minimum_heights: List[int],
+    immersion_depths: List[int],
+    surface_following_distances: List[int],
+    aspiration_volumes: List[int],
+    aspiration_speeds: List[int],
+    transport_air_volumes: List[int],
+    blow_out_air_volumes: List[int],
+    pre_wetting_volumes: List[int],
+    lld_modes: List[int],
+    clld_sensitivities: List[int],
+    plld_sensitivities: List[int],
+    aspirate_positions_above_z_touch_off: List[int],
+    swap_speeds: List[int],
+    settling_times: List[int],
+    mix_volumes: List[int],
+    mix_cycles: List[int],
+    mix_positions_from_liquid_surface: List[int],
+    mix_speeds: List[int],
+    mix_surface_following_distances: List[int],
+    adc_algorithms: List[bool],
+    capacitive_mad_supervisions: List[bool],
+    pressure_mad_supervisions: List[bool],
+    tadm_algorithm: bool,
+    limit_curve_indices: List[int],
+    recording_mode: int,
+  ) -> None:
+    """Send an aspiration as it goes on the wire (`A1PM DA`), with every value checked by nothing.
+
+    Every list holds one value for each channel of the machine, and every value is already in the
+    unit the wire carries: tenths of a mm, hundredths of a uL for a volume, tenths for a speed in
+    uL/s. `PipettesConfiguration` converts from mm, uL and uL/s.
+
+    Args:
+      aspiration_type: 0 simple, 1 sequence, 2 cup emptied (`at`).
+      tip_pattern: which channels take part (`tm`).
+      x_positions: where each channel goes, along X (`xp`).
+      y_positions: where each channel goes, along Y (`yp`).
+      minimum_traverse_height_start: how high the channels travel first (`th`).
+      minimum_z_end_position: how high they end (`te`).
+      lld_search_heights: where each channel starts searching for the liquid (`lp`).
+      clot_detection_heights: how far below the surface a clot is looked for (`ch`).
+      liquid_surfaces_no_lld: the surface each channel uses when LLD is off (`zl`).
+      pull_out_distances_transport_air: how far a channel pulls out to take transport air (`po`).
+      second_section_heights: the second section's height, measured from the Z reference (`zu`).
+      second_section_ratios: the second section's ratio, in ten-thousandths (`zr`).
+      minimum_heights: the lowest each channel may go (`zx`).
+      immersion_depths: how far into the liquid each tip goes, negative being out of it (`ip`).
+      surface_following_distances: how far each channel follows the surface (`fp`).
+      aspiration_volumes: what each channel draws (`av`).
+      aspiration_speeds: how fast (`as`).
+      transport_air_volumes: transport air drawn per channel (`ta`).
+      blow_out_air_volumes: air blown out per channel (`ba`).
+      pre_wetting_volumes: drawn and returned before the aspiration (`oa`).
+      lld_modes: how each channel finds the liquid, 0 off to 4 (`lm`).
+      clld_sensitivities: capacitive LLD sensitivity, 1 high to 4 low (`ll`).
+      plld_sensitivities: pressure LLD sensitivity, 1 high to 4 low (`lv`).
+      aspirate_positions_above_z_touch_off: where a channel draws above a Z touch-off (`zo`).
+      swap_speeds: how fast each channel leaves the liquid (`de`).
+      settling_times: how long each channel waits after drawing (`wt`).
+      mix_volumes: what each channel mixes with (`mv`).
+      mix_cycles: how many times each channel mixes (`mc`).
+      mix_positions_from_liquid_surface: where each channel mixes, from its actual position
+        (`mp`).
+      mix_speeds: how fast each channel mixes (`ms`).
+      mix_surface_following_distances: how far each channel follows during mixing (`mh`).
+      adc_algorithms: whether each channel uses the ADC algorithm (`la`).
+      capacitive_mad_supervisions: whether capacitive MAD supervision is on (`lb`).
+      pressure_mad_supervisions: whether pressure MAD supervision is on (`lc`).
+      tadm_algorithm: whether the TADM algorithm is on (`gj`).
+      limit_curve_indices: which limit curve each channel uses (`gi`).
+      recording_mode: 0 none, 1 TADM errors, 2 all TADM measurements (`gk`).
+    """
+    await self._driver.send_command(
+      module="A1PM",
+      command="DA",
+      at=aspiration_type,
+      tm=tip_pattern,
+      xp=x_positions,
+      yp=y_positions,
+      th=minimum_traverse_height_start,
+      te=minimum_z_end_position,
+      lp=lld_search_heights,
+      ch=clot_detection_heights,
+      zl=liquid_surfaces_no_lld,
+      po=pull_out_distances_transport_air,
+      zu=second_section_heights,
+      zr=second_section_ratios,
+      zx=minimum_heights,
+      ip=immersion_depths,
+      fp=surface_following_distances,
+      av=aspiration_volumes,
+      as_=aspiration_speeds,
+      ta=transport_air_volumes,
+      ba=blow_out_air_volumes,
+      oa=pre_wetting_volumes,
+      lm=lld_modes,
+      ll=clld_sensitivities,
+      lv=plld_sensitivities,
+      zo=aspirate_positions_above_z_touch_off,
+      de=swap_speeds,
+      wt=settling_times,
+      mv=mix_volumes,
+      mc=mix_cycles,
+      mp=mix_positions_from_liquid_surface,
+      ms=mix_speeds,
+      mh=mix_surface_following_distances,
+      la=adc_algorithms,
+      lb=capacitive_mad_supervisions,
+      lc=pressure_mad_supervisions,
+      gj=tadm_algorithm,
+      gi=limit_curve_indices,
+      gk=recording_mode,
+    )
+
+  async def _unchecked_fw_dispense(
+    self,
+    dispense_mode: List[int],
+    tip_pattern: List[bool],
+    x_positions: List[int],
+    y_positions: List[int],
+    minimum_heights: List[int],
+    lld_search_heights: List[int],
+    liquid_surfaces_no_lld: List[int],
+    pull_out_distances_transport_air: List[int],
+    immersion_depths: List[int],
+    surface_following_distances: List[int],
+    second_section_heights: List[int],
+    second_section_ratios: List[int],
+    minimum_traverse_height_start: List[int],
+    minimum_z_end_position: List[int],
+    dispense_volumes: List[int],
+    dispense_speeds: List[int],
+    cut_off_speeds: List[int],
+    stop_back_volumes: List[int],
+    transport_air_volumes: List[int],
+    blow_out_air_volumes: List[int],
+    lld_modes: List[int],
+    side_touch_off_distance: int,
+    dispense_positions_above_z_touch_off: List[int],
+    clld_sensitivities: List[int],
+    plld_sensitivities: List[int],
+    swap_speeds: List[int],
+    settling_times: List[int],
+    mix_volumes: List[int],
+    mix_cycles: List[int],
+    mix_positions_from_liquid_surface: List[int],
+    mix_speeds: List[int],
+    mix_surface_following_distances: List[int],
+    adc_algorithms: List[bool],
+    tadm_algorithm: bool,
+    limit_curve_indices: List[int],
+    recording_mode: int,
+  ) -> None:
+    """Send a dispense as it goes on the wire (`A1PM DD`), with every value checked by nothing.
+
+    Every list holds one value for each channel of the machine, and every value is already in the
+    unit the wire carries: tenths of a mm, hundredths of a uL for a volume, tenths for a speed in
+    uL/s. `PipettesConfiguration` converts from mm, uL and uL/s.
+
+    Args:
+      dispense_mode: the mode from `_get_dispense_mode` (`dm`).
+      tip_pattern: which channels take part (`tm`).
+      x_positions: where each channel goes, along X (`xp`).
+      y_positions: where each channel goes, along Y (`yp`).
+      minimum_heights: the lowest each channel may go (`zx`).
+      lld_search_heights: where each channel starts searching for the liquid (`lp`).
+      liquid_surfaces_no_lld: the surface each channel uses when LLD is off (`zl`).
+      pull_out_distances_transport_air: how far a channel pulls out to take transport air (`po`).
+      immersion_depths: how far into the liquid each tip goes, negative being out of it (`ip`).
+      surface_following_distances: how far each channel follows the surface (`fp`).
+      second_section_heights: the second section's height, measured from the Z reference (`zu`).
+      second_section_ratios: the second section's ratio, in ten-thousandths (`zr`).
+      minimum_traverse_height_start: how high the channels travel first (`th`).
+      minimum_z_end_position: how high they end (`te`).
+      dispense_volumes: what each channel gives (`dv`).
+      dispense_speeds: how fast (`ds`).
+      cut_off_speeds: the speed each channel cuts off at (`ss`).
+      stop_back_volumes: how much each channel stops back (`rv`).
+      transport_air_volumes: transport air drawn per channel (`ta`).
+      blow_out_air_volumes: air blown out per channel (`ba`).
+      lld_modes: how each channel finds the liquid, 0 off to 4 (`lm`).
+      side_touch_off_distance: how far a channel touches off to the side (`dj`).
+      dispense_positions_above_z_touch_off: where a channel dispenses above a Z touch-off (`zo`).
+      clld_sensitivities: capacitive LLD sensitivity, 1 high to 4 low (`ll`).
+      plld_sensitivities: pressure LLD sensitivity, 1 high to 4 low (`lv`).
+      swap_speeds: how fast each channel leaves the liquid (`de`).
+      settling_times: how long each channel waits after dispensing (`wt`).
+      mix_volumes: what each channel mixes with (`mv`).
+      mix_cycles: how many times each channel mixes (`mc`).
+      mix_positions_from_liquid_surface: where each channel mixes, from its actual position
+        (`mp`).
+      mix_speeds: how fast each channel mixes (`ms`).
+      mix_surface_following_distances: how far each channel follows during mixing (`mh`).
+      adc_algorithms: whether each channel uses the ADC algorithm (`la`).
+      tadm_algorithm: whether the TADM algorithm is on (`gj`).
+      limit_curve_indices: which limit curve each channel uses (`gi`).
+      recording_mode: 0 none, 1 TADM errors, 2 all TADM measurements (`gk`).
+    """
+    await self._driver.send_command(
+      module="A1PM",
+      command="DD",
+      dm=dispense_mode,
+      tm=tip_pattern,
+      xp=x_positions,
+      yp=y_positions,
+      zx=minimum_heights,
+      lp=lld_search_heights,
+      zl=liquid_surfaces_no_lld,
+      po=pull_out_distances_transport_air,
+      ip=immersion_depths,
+      fp=surface_following_distances,
+      zu=second_section_heights,
+      zr=second_section_ratios,
+      th=minimum_traverse_height_start,
+      te=minimum_z_end_position,
+      # At least four digits, as the machine takes the volume: a shorter number is read wrong.
+      dv=[f"{volume:04}" for volume in dispense_volumes],
+      ds=dispense_speeds,
+      ss=cut_off_speeds,
+      rv=stop_back_volumes,
+      ta=transport_air_volumes,
+      ba=blow_out_air_volumes,
+      lm=lld_modes,
+      dj=side_touch_off_distance,
+      zo=dispense_positions_above_z_touch_off,
+      ll=clld_sensitivities,
+      lv=plld_sensitivities,
+      de=swap_speeds,
+      wt=settling_times,
+      mv=mix_volumes,
+      mc=mix_cycles,
+      mp=mix_positions_from_liquid_surface,
+      ms=mix_speeds,
+      mh=mix_surface_following_distances,
+      la=adc_algorithms,
+      gj=tadm_algorithm,
+      gi=limit_curve_indices,
+      gk=recording_mode,
+    )
+
+  # -- aspiration and dispensing over containers ---------------------------
+
+  async def aspirate(
+    self,
+    containers: Sequence[Container],
+    volumes: Sequence[float],
+    use_channels: Optional[List[int]] = None,
+    resource_offsets: Optional[List[Coordinate]] = None,
+    liquid_heights: Optional[Sequence[Optional[float]]] = None,
+    lld_mode: Union[LLDMode, Sequence[LLDMode], None] = None,
+    flow_rates: Optional[Sequence[float]] = None,
+    *,
+    immersion_depths: Optional[Sequence[float]] = None,
+    blow_out_air_volumes: Optional[Sequence[float]] = None,
+    transport_air_volumes: Optional[Sequence[float]] = None,
+    pre_wetting_volumes: Optional[Sequence[float]] = None,
+    surface_following_distances: Optional[Sequence[float]] = None,
+    clot_detection_heights: Optional[Sequence[float]] = None,
+    pull_out_distances_transport_air: Optional[Sequence[float]] = None,
+    swap_speeds: Optional[Sequence[float]] = None,
+    settling_times: Optional[Sequence[float]] = None,
+    minimum_traverse_height_start: Optional[float] = None,
+    minimum_traverse_height_end: Optional[float] = None,
+    lld_sensitivities: Optional[Sequence[int]] = None,
+    pressure_lld_sensitivities: Optional[Sequence[int]] = None,
+  ) -> None:
+    """Draw liquid from each container with one channel's tip. Moves the channels.
+
+    The place each channel goes to comes from the deck model: the container's centre, its cavity
+    bottom and the liquid surface at `liquid_heights` above that bottom. The driver applies no
+    correction of its own.
+
+    Args:
+      containers: one container for each channel, in channel order.
+      volumes: what each channel draws, in uL.
+      use_channels: which channels, 0-indexed from the back. The first `len(containers)` when None.
+      resource_offsets: added to each container's centre, in mm. The z shifts the heights.
+      liquid_heights: the liquid's height above each cavity bottom, in mm. The bottom when None.
+      lld_mode: how each channel finds the liquid, one for all or one per container. OFF when
+        None, and then `liquid_heights` says where the surface is; with a mode, the machine
+        searches from above the container and `liquid_heights` must be None.
+      flow_rates: how fast each channel draws, in uL/s. 100.0 when None.
+      immersion_depths: how far into the liquid each tip goes, in mm. 0.0 when None.
+      blow_out_air_volumes: air drawn before the liquid, in uL. 0.0 when None.
+      transport_air_volumes: air drawn after the liquid, in uL. 0.0 when None.
+      pre_wetting_volumes: drawn and returned first, in uL. 0.0 when None.
+      surface_following_distances: how far each tip follows the surface, in mm. 0.0 when None.
+      clot_detection_heights: how far a clot may hold the tip back, in mm. 0.0 when None.
+      pull_out_distances_transport_air: rise before drawing transport air, in mm. 10.0 when None.
+      swap_speeds: speed of leaving the liquid, in mm/s. 100.0 when None.
+      settling_times: wait in the liquid, in s. 0.0 when None.
+      minimum_traverse_height_start: how high the channels travel first, in mm. The configured
+        default when None.
+      minimum_traverse_height_end: how high they end, in mm. The configured default when None.
+      lld_sensitivities: capacitive LLD sensitivity, 1 high to 4 low. 1 when None.
+      pressure_lld_sensitivities: pressure LLD sensitivity, 1 high to 4 low. 1 when None.
+
+    Raises:
+      RuntimeError: If the driver has no deck.
+      ValueError: If the arguments do not come in pairs or a value is out of range.
+      ValueError: If the LLD mode is not one this command accepts, or `liquid_heights` is given
+        beside one.
+    """
+    modes = self._lld_modes(len(containers), lld_mode, allowed=tuple(LLDMode))
+    if liquid_heights is not None and any(mode != LLDMode.OFF for mode in modes):
+      raise ValueError(
+        "`liquid_heights` says where the surface is when LLD is off; with an LLD mode the "
+        "machine searches for it"
+      )
+    channels = self._channels_for(len(containers), use_channels)
+    if len(volumes) != len(channels):
+      raise ValueError(
+        f"one volume for each of the {len(channels)} channels is needed, but {len(volumes)} are "
+        "given"
+      )
+    _check_range("volumes", list(volumes), (0.0, 1250.0))
+    config = self.configuration
+    xs, ys, bottoms, surfaces, searches = self._container_places(
+      containers, resource_offsets, liquid_heights
+    )
+    start = (
+      config.default_minimal_traverse_height
+      if minimum_traverse_height_start is None
+      else minimum_traverse_height_start
+    )
+    end = (
+      config.default_minimal_traverse_height
+      if minimum_traverse_height_end is None
+      else minimum_traverse_height_end
+    )
+    _check_traverse_height(start, config)
+    _check_traverse_height(end, config)
+
+    flow = self._by_channel("flow_rates", flow_rates, channels, 100.0)
+    immersion = self._by_channel("immersion_depths", immersion_depths, channels, 0.0)
+    blow_out = self._by_channel("blow_out_air_volumes", blow_out_air_volumes, channels, 0.0)
+    transport = self._by_channel("transport_air_volumes", transport_air_volumes, channels, 0.0)
+    pre_wetting = self._by_channel("pre_wetting_volumes", pre_wetting_volumes, channels, 0.0)
+    following = self._by_channel(
+      "surface_following_distances", surface_following_distances, channels, 0.0
+    )
+    clots = self._by_channel("clot_detection_heights", clot_detection_heights, channels, 0.0)
+    pull_out = self._by_channel(
+      "pull_out_distances_transport_air", pull_out_distances_transport_air, channels, 10.0
+    )
+    swaps = self._by_channel("swap_speeds", swap_speeds, channels, 100.0)
+    settle = self._by_channel("settling_times", settling_times, channels, 0.0)
+    clld = self._by_channel("lld_sensitivities", lld_sensitivities, channels, 1)
+    plld = self._by_channel("pressure_lld_sensitivities", pressure_lld_sensitivities, channels, 1)
+
+    _check_range("flow_rates", flow, (1.0, 1000.0))
+    _check_range("immersion_depths", immersion, (-360.0, 360.0))
+    _check_range("blow_out_air_volumes", blow_out, (0.0, 1250.0))
+    _check_range("transport_air_volumes", transport, (0.0, 50.0))
+    _check_range("pre_wetting_volumes", pre_wetting, (0.0, 99.9))
+    _check_range("surface_following_distances", following, (0.0, 360.0))
+    _check_range("clot_detection_heights", clots, (0.0, 50.0))
+    _check_range("pull_out_distances_transport_air", pull_out, (0.0, 360.0))
+    _check_range("swap_speeds", swaps, (0.3, 160.0))
+    _check_range("settling_times", settle, (0.0, 9.9))
+    _check_range("lld_sensitivities", clld, (1, 4))  # type: ignore[arg-type]
+    _check_range("pressure_lld_sensitivities", plld, (1, 4))  # type: ignore[arg-type]
+
+    xs = self._by_channel("x_positions", xs, channels, 0.0)
+    ys = self._by_channel("y_positions", ys, channels, 0.0)
+    bottoms = self._by_channel("the cavity bottom", bottoms, channels, 0.0)
+    surfaces = self._by_channel("the liquid surface", surfaces, channels, 0.0)
+    searches = self._by_channel("the LLD search height", searches, channels, 0.0)
+    drawn = self._by_channel("volumes", list(volumes), channels, 0.0)
+
+    trackers = self._book_liquid(containers, volumes, adding=False)
+    command = self._unchecked_fw_aspirate(
+      aspiration_type=[0] * self.num_channels,
+      tip_pattern=self._tip_pattern(channels),
+      x_positions=self._increments(xs),
+      y_positions=self._increments(ys),
+      minimum_traverse_height_start=[config.to_increments(start)] * self.num_channels,
+      minimum_z_end_position=[config.to_increments(end)] * self.num_channels,
+      lld_search_heights=self._increments(searches),
+      clot_detection_heights=self._increments(clots),
+      liquid_surfaces_no_lld=self._increments(surfaces),
+      pull_out_distances_transport_air=self._increments(pull_out),
+      second_section_heights=[0] * self.num_channels,
+      second_section_ratios=[0] * self.num_channels,
+      minimum_heights=self._increments(bottoms),
+      immersion_depths=self._increments(immersion),
+      surface_following_distances=self._increments(following),
+      aspiration_volumes=[round(volume * 100) for volume in drawn],
+      aspiration_speeds=[config.to_increments(rate) for rate in flow],
+      transport_air_volumes=[config.to_increments(volume) for volume in transport],
+      blow_out_air_volumes=[round(volume * 100) for volume in blow_out],
+      pre_wetting_volumes=[config.to_increments(volume) for volume in pre_wetting],
+      lld_modes=self._by_channel("lld_modes", [mode.value for mode in modes], channels, 0),
+      clld_sensitivities=[int(value) for value in clld],
+      plld_sensitivities=[int(value) for value in plld],
+      aspirate_positions_above_z_touch_off=[5] * self.num_channels,
+      swap_speeds=[config.to_increments(speed) for speed in swaps],
+      settling_times=[round(value * 10) for value in settle],
+      mix_volumes=[0] * self.num_channels,
+      mix_cycles=[0] * self.num_channels,
+      mix_positions_from_liquid_surface=[250] * self.num_channels,
+      mix_speeds=[500] * self.num_channels,
+      mix_surface_following_distances=[0] * self.num_channels,
+      adc_algorithms=[False] * self.num_channels,
+      capacitive_mad_supervisions=[False] * self.num_channels,
+      pressure_mad_supervisions=[False] * self.num_channels,
+      tadm_algorithm=False,
+      limit_curve_indices=[0] * self.num_channels,
+      recording_mode=0,
+    )
+    try:
+      await command
+    except BaseException:
+      for tracker in trackers:
+        tracker.rollback()
+      raise
+    for tracker in trackers:
+      tracker.commit()
+    if any(mode != LLDMode.OFF for mode in modes):
+      await self._correct_trackers_from_lld(
+        containers, channels, [bottoms[channel] for channel in channels]
+      )
+
+  async def dispense(
+    self,
+    containers: Sequence[Container],
+    volumes: Sequence[float],
+    use_channels: Optional[List[int]] = None,
+    resource_offsets: Optional[List[Coordinate]] = None,
+    liquid_heights: Optional[Sequence[Optional[float]]] = None,
+    lld_mode: Union[LLDMode, Sequence[LLDMode], None] = None,
+    flow_rates: Optional[Sequence[float]] = None,
+    *,
+    jet: Optional[Sequence[bool]] = None,
+    blow_out: Optional[Sequence[bool]] = None,
+    empty: Optional[Sequence[bool]] = None,
+    immersion_depths: Optional[Sequence[float]] = None,
+    blow_out_air_volumes: Optional[Sequence[float]] = None,
+    transport_air_volumes: Optional[Sequence[float]] = None,
+    cut_off_speeds: Optional[Sequence[float]] = None,
+    stop_back_volumes: Optional[Sequence[float]] = None,
+    surface_following_distances: Optional[Sequence[float]] = None,
+    swap_speeds: Optional[Sequence[float]] = None,
+    settling_times: Optional[Sequence[float]] = None,
+    side_touch_off_distance: float = 0.0,
+    minimum_traverse_height_start: Optional[float] = None,
+    minimum_traverse_height_end: Optional[float] = None,
+    lld_sensitivities: Optional[Sequence[int]] = None,
+    pressure_lld_sensitivities: Optional[Sequence[int]] = None,
+  ) -> None:
+    """Give liquid into each container with one channel's tip. Moves the channels.
+
+    The place each channel goes to comes from the deck model, as for `aspirate`.
+
+    Args:
+      containers: one container for each channel, in channel order.
+      volumes: what each channel gives, in uL.
+      use_channels: which channels, 0-indexed from the back. The first `len(containers)` when None.
+      resource_offsets: added to each container's centre, in mm. The z shifts the heights.
+      liquid_heights: the liquid's height above each cavity bottom, in mm. The bottom when None.
+      lld_mode: how each channel finds the liquid, one for all or one per container. OFF when
+        None, and then `liquid_heights` says where the surface is; with a mode, the machine
+        searches from above the container and `liquid_heights` must be None. Dispensing accepts
+        OFF, CAPACITIVE and ZTOUCH.
+      flow_rates: how fast each channel gives, in uL/s. 100.0 when None.
+      jet: whether each channel gives a jet. False when None.
+      blow_out: whether each channel blows out after the liquid. False when None.
+      empty: whether each channel empties its tip. False when None.
+      immersion_depths: how far into the liquid each tip goes, in mm. 0.0 when None.
+      blow_out_air_volumes: air pushed out after the liquid, in uL. 0.0 when None.
+      transport_air_volumes: air drawn after the dispense, in uL. 0.0 when None.
+      cut_off_speeds: the flow each dispense ends at, in uL/s. 5.0 when None.
+      stop_back_volumes: drawn back after each dispense, in uL. 0.0 when None.
+      surface_following_distances: how far each tip follows the surface, in mm. 0.0 when None.
+      swap_speeds: speed of leaving the liquid, in mm/s. 10.0 when None.
+      settling_times: wait after the dispense, in s. 0.0 when None.
+      side_touch_off_distance: how far a channel touches off to the side, in mm. 0.0 when None.
+      minimum_traverse_height_start: how high the channels travel first, in mm. The configured
+        default when None.
+      minimum_traverse_height_end: how high they end, in mm. The configured default when None.
+      lld_sensitivities: capacitive LLD sensitivity, 1 high to 4 low. 1 when None.
+      pressure_lld_sensitivities: pressure LLD sensitivity, 1 high to 4 low. 1 when None.
+
+    Raises:
+      RuntimeError: If the driver has no deck.
+      ValueError: If the arguments do not come in pairs or a value is out of range.
+      ValueError: If the LLD mode is not one this command accepts, or `liquid_heights` is given
+        beside one.
+    """
+    modes = self._lld_modes(
+      len(containers), lld_mode, allowed=(LLDMode.OFF, LLDMode.CAPACITIVE, LLDMode.ZTOUCH)
+    )
+    if liquid_heights is not None and any(mode != LLDMode.OFF for mode in modes):
+      raise ValueError(
+        "`liquid_heights` says where the surface is when LLD is off; with an LLD mode the "
+        "machine searches for it"
+      )
+    channels = self._channels_for(len(containers), use_channels)
+    if len(volumes) != len(channels):
+      raise ValueError(
+        f"one volume for each of the {len(channels)} channels is needed, but {len(volumes)} are "
+        "given"
+      )
+    _check_range("volumes", list(volumes), (0.0, 1250.0))
+    config = self.configuration
+    xs, ys, bottoms, surfaces, searches = self._container_places(
+      containers, resource_offsets, liquid_heights
+    )
+    start = (
+      config.default_minimal_traverse_height
+      if minimum_traverse_height_start is None
+      else minimum_traverse_height_start
+    )
+    end = (
+      config.default_minimal_traverse_height
+      if minimum_traverse_height_end is None
+      else minimum_traverse_height_end
+    )
+    _check_traverse_height(start, config)
+    _check_traverse_height(end, config)
+    _check_range("side_touch_off_distance", [side_touch_off_distance], (0.0, 4.5))
+
+    flow = self._by_channel("flow_rates", flow_rates, channels, 100.0)
+    jets = self._by_channel("jet", jet, channels, False)
+    blows = self._by_channel("blow_out", blow_out, channels, False)
+    empties = self._by_channel("empty", empty, channels, False)
+    immersion = self._by_channel("immersion_depths", immersion_depths, channels, 0.0)
+    blow_out_air = self._by_channel("blow_out_air_volumes", blow_out_air_volumes, channels, 0.0)
+    transport = self._by_channel("transport_air_volumes", transport_air_volumes, channels, 0.0)
+    cut_off = self._by_channel("cut_off_speeds", cut_off_speeds, channels, 5.0)
+    stop_back = self._by_channel("stop_back_volumes", stop_back_volumes, channels, 0.0)
+    following = self._by_channel(
+      "surface_following_distances", surface_following_distances, channels, 0.0
+    )
+    swaps = self._by_channel("swap_speeds", swap_speeds, channels, 10.0)
+    settle = self._by_channel("settling_times", settling_times, channels, 0.0)
+    clld = self._by_channel("lld_sensitivities", lld_sensitivities, channels, 1)
+    plld = self._by_channel("pressure_lld_sensitivities", pressure_lld_sensitivities, channels, 1)
+
+    _check_range("flow_rates", flow, (1.0, 1000.0))
+    _check_range("immersion_depths", immersion, (-360.0, 360.0))
+    _check_range("blow_out_air_volumes", blow_out_air, (0.0, 1250.0))
+    _check_range("transport_air_volumes", transport, (0.0, 50.0))
+    _check_range("cut_off_speeds", cut_off, (1.0, 1000.0))
+    _check_range("stop_back_volumes", stop_back, (0.0, 18.0))
+    _check_range("surface_following_distances", following, (0.0, 360.0))
+    _check_range("swap_speeds", swaps, (0.3, 160.0))
+    _check_range("settling_times", settle, (0.0, 9.9))
+    _check_range("lld_sensitivities", clld, (1, 4))  # type: ignore[arg-type]
+    _check_range("pressure_lld_sensitivities", plld, (1, 4))  # type: ignore[arg-type]
+
+    xs = self._by_channel("x_positions", xs, channels, 0.0)
+    ys = self._by_channel("y_positions", ys, channels, 0.0)
+    bottoms = self._by_channel("the cavity bottom", bottoms, channels, 0.0)
+    surfaces = self._by_channel("the liquid surface", surfaces, channels, 0.0)
+    searches = self._by_channel("the LLD search height", searches, channels, 0.0)
+    given = self._by_channel("volumes", list(volumes), channels, 0.0)
+
+    trackers = self._book_liquid(containers, volumes, adding=True)
+    command = self._unchecked_fw_dispense(
+      dispense_mode=[
+        _get_dispense_mode(bool(j), bool(e), bool(b)) for j, e, b in zip(jets, empties, blows)
+      ],
+      tip_pattern=self._tip_pattern(channels),
+      x_positions=self._increments(xs),
+      y_positions=self._increments(ys),
+      minimum_heights=self._increments(bottoms),
+      lld_search_heights=self._increments(searches),
+      liquid_surfaces_no_lld=self._increments(surfaces),
+      pull_out_distances_transport_air=[config.to_increments(10.0)] * self.num_channels,
+      immersion_depths=self._increments(immersion),
+      surface_following_distances=self._increments(following),
+      second_section_heights=[0] * self.num_channels,
+      second_section_ratios=[0] * self.num_channels,
+      minimum_traverse_height_start=[config.to_increments(start)] * self.num_channels,
+      minimum_z_end_position=[config.to_increments(end)] * self.num_channels,
+      dispense_volumes=[round(volume * 100) for volume in given],
+      dispense_speeds=[config.to_increments(rate) for rate in flow],
+      cut_off_speeds=[config.to_increments(rate) for rate in cut_off],
+      stop_back_volumes=[config.to_increments(volume) for volume in stop_back],
+      transport_air_volumes=[config.to_increments(volume) for volume in transport],
+      blow_out_air_volumes=[round(volume * 100) for volume in blow_out_air],
+      lld_modes=self._by_channel("lld_modes", [mode.value for mode in modes], channels, 0),
+      side_touch_off_distance=config.to_increments(side_touch_off_distance),
+      dispense_positions_above_z_touch_off=[5] * self.num_channels,
+      clld_sensitivities=[int(value) for value in clld],
+      plld_sensitivities=[int(value) for value in plld],
+      swap_speeds=[config.to_increments(speed) for speed in swaps],
+      settling_times=[round(value * 10) for value in settle],
+      mix_volumes=[0] * self.num_channels,
+      mix_cycles=[0] * self.num_channels,
+      mix_positions_from_liquid_surface=[250] * self.num_channels,
+      mix_speeds=[500] * self.num_channels,
+      mix_surface_following_distances=[0] * self.num_channels,
+      adc_algorithms=[False] * self.num_channels,
+      tadm_algorithm=False,
+      limit_curve_indices=[0] * self.num_channels,
+      recording_mode=0,
+    )
+    try:
+      await command
+    except BaseException:
+      for tracker in trackers:
+        tracker.rollback()
+      raise
+    for tracker in trackers:
+      tracker.commit()
 
   async def pick_up_tips(
     self,

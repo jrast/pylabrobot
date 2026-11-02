@@ -2,19 +2,26 @@ import re
 import unittest
 from typing import Any, List, Optional, Tuple
 
+from pylabrobot.hamilton.star.driver.lld_mode import LLDMode
 from pylabrobot.hamilton.vantage.driver.errors import VantageFirmwareError
-from pylabrobot.hamilton.vantage.driver.features.pipettes import Pipettes, PipettesConfiguration
+from pylabrobot.hamilton.vantage.driver.features.pipettes import (
+  Pipettes,
+  PipettesConfiguration,
+  _get_dispense_mode,
+)
 from pylabrobot.hamilton.vantage.driver.master import VantageDriver
 from pylabrobot.hamilton.vantage.driver.master_tests import ScriptedIO, echo, machine
+from pylabrobot.hamilton.vantage.driver.simulator import parameters, positions
 from pylabrobot.legacy.liquid_handling.backends.hamilton.vantage_backend import VantageBackend
 from pylabrobot.resources.coordinate import Coordinate
-from pylabrobot.resources.errors import HasTipError, NoTipError
+from pylabrobot.resources.errors import HasTipError, NoTipError, TooLittleLiquidError
 from pylabrobot.resources.hamilton.tip_carriers import hamilton_tip_carrier_L5
 from pylabrobot.resources.hamilton.tip_creators import HamiltonTip, TipPickupMethod
 from pylabrobot.resources.hamilton.tip_racks import hamilton_96_tiprack_300uL
 from pylabrobot.resources.hamilton.vantage_decks import VantageDeck
 from pylabrobot.resources.tip_rack import TipRack
 from pylabrobot.resources.tip_tracking import set_tip_tracking
+from pylabrobot.resources.volume_tracker import set_volume_tracking
 
 PIPETTES_LOGGER = "pylabrobot.hamilton.vantage.driver.features.pipettes"
 
@@ -880,3 +887,332 @@ class TestCoreGripperCommands(PositioningTestCase):
     await self.pipettes._unchecked_fw_release_core_gripper_object(first_channel=3)
     self.assertEqual(self.sent(), ["A1PMDOpa3"])
     self.assertEqual(self.sent()[-1], without_id(catcher.commands[-1]))
+
+
+class TestDispenseMode(unittest.TestCase):
+  """Turning a jet, an empty and a blow-out into the firmware's dispense mode."""
+
+  def test_a_jet_parts_the_liquid(self):
+    self.assertEqual(_get_dispense_mode(jet=True, empty=False, blow_out=False), 0)
+
+  def test_a_jet_with_a_blow_out(self):
+    self.assertEqual(_get_dispense_mode(jet=True, empty=False, blow_out=True), 1)
+
+  def test_liquid_stands_at_the_surface(self):
+    self.assertEqual(_get_dispense_mode(jet=False, empty=False, blow_out=False), 2)
+
+  def test_liquid_stands_at_the_surface_with_a_blow_out(self):
+    self.assertEqual(_get_dispense_mode(jet=False, empty=False, blow_out=True), 3)
+
+  def test_an_empty_empties_the_tip(self):
+    self.assertEqual(_get_dispense_mode(jet=False, empty=True, blow_out=False), 4)
+
+  def test_an_empty_ignores_a_jet_and_a_blow_out(self):
+    self.assertEqual(_get_dispense_mode(jet=True, empty=True, blow_out=True), 4)
+
+
+class TestRawAspirateDispense(PositioningTestCase):
+  """The raw commands, sent exactly as they are given."""
+
+  def eight(self, value):
+    return [value] * 8
+
+  async def test_the_raw_aspiration_command(self):
+    await self.pipettes._unchecked_fw_aspirate(
+      aspiration_type=self.eight(0),
+      tip_pattern=[True] * 8,
+      x_positions=self.eight(1000),
+      y_positions=self.eight(3000),
+      minimum_traverse_height_start=self.eight(2450),
+      minimum_z_end_position=self.eight(2450),
+      lld_search_heights=self.eight(0),
+      clot_detection_heights=self.eight(60),
+      liquid_surfaces_no_lld=self.eight(0),
+      pull_out_distances_transport_air=self.eight(50),
+      second_section_heights=self.eight(0),
+      second_section_ratios=self.eight(0),
+      minimum_heights=self.eight(3600),
+      immersion_depths=self.eight(0),
+      surface_following_distances=self.eight(0),
+      aspiration_volumes=self.eight(100),
+      aspiration_speeds=self.eight(500),
+      transport_air_volumes=self.eight(0),
+      blow_out_air_volumes=self.eight(0),
+      pre_wetting_volumes=self.eight(0),
+      lld_modes=self.eight(1),
+      clld_sensitivities=self.eight(1),
+      plld_sensitivities=self.eight(1),
+      aspirate_positions_above_z_touch_off=self.eight(5),
+      swap_speeds=self.eight(100),
+      settling_times=self.eight(5),
+      mix_volumes=self.eight(0),
+      mix_cycles=self.eight(0),
+      mix_positions_from_liquid_surface=self.eight(250),
+      mix_speeds=self.eight(500),
+      mix_surface_following_distances=self.eight(0),
+      adc_algorithms=[False] * 8,
+      capacitive_mad_supervisions=[False] * 8,
+      pressure_mad_supervisions=[False] * 8,
+      tadm_algorithm=False,
+      limit_curve_indices=self.eight(0),
+      recording_mode=0,
+    )
+    self.assertEqual(
+      self.sent(),
+      [
+        "A1PMDAat0 0 0 0 0 0 0 0tm1 1 1 1 1 1 1 1xp1000 1000 1000 1000 1000 1000 1000 1000"
+        "yp3000 3000 3000 3000 3000 3000 3000 3000th2450 2450 2450 2450 2450 2450 2450 2450"
+        "te2450 2450 2450 2450 2450 2450 2450 2450lp0 0 0 0 0 0 0 0"
+        "ch60 60 60 60 60 60 60 60zl0 0 0 0 0 0 0 0po50 50 50 50 50 50 50 50"
+        "zu0 0 0 0 0 0 0 0zr0 0 0 0 0 0 0 0zx3600 3600 3600 3600 3600 3600 3600 3600"
+        "ip0 0 0 0 0 0 0 0fp0 0 0 0 0 0 0 0av100 100 100 100 100 100 100 100"
+        "as500 500 500 500 500 500 500 500ta0 0 0 0 0 0 0 0ba0 0 0 0 0 0 0 0"
+        "oa0 0 0 0 0 0 0 0lm1 1 1 1 1 1 1 1ll1 1 1 1 1 1 1 1lv1 1 1 1 1 1 1 1"
+        "zo5 5 5 5 5 5 5 5de100 100 100 100 100 100 100 100wt5 5 5 5 5 5 5 5"
+        "mv0 0 0 0 0 0 0 0mc0 0 0 0 0 0 0 0mp250 250 250 250 250 250 250 250"
+        "ms500 500 500 500 500 500 500 500mh0 0 0 0 0 0 0 0la0 0 0 0 0 0 0 0"
+        "lb0 0 0 0 0 0 0 0lc0 0 0 0 0 0 0 0gj0gi0 0 0 0 0 0 0 0gk0"
+      ],
+    )
+
+  async def test_a_dispense_volume_is_written_with_four_digits(self):
+    await self.pipettes._unchecked_fw_dispense(
+      dispense_mode=self.eight(3),
+      tip_pattern=[True] * 8,
+      x_positions=self.eight(1000),
+      y_positions=self.eight(3000),
+      minimum_heights=self.eight(3600),
+      lld_search_heights=self.eight(0),
+      liquid_surfaces_no_lld=self.eight(0),
+      pull_out_distances_transport_air=self.eight(50),
+      immersion_depths=self.eight(0),
+      surface_following_distances=self.eight(0),
+      second_section_heights=self.eight(0),
+      second_section_ratios=self.eight(0),
+      minimum_traverse_height_start=self.eight(2450),
+      minimum_z_end_position=self.eight(2450),
+      dispense_volumes=self.eight(5),
+      dispense_speeds=self.eight(1200),
+      cut_off_speeds=self.eight(2500),
+      stop_back_volumes=self.eight(0),
+      transport_air_volumes=self.eight(50),
+      blow_out_air_volumes=self.eight(0),
+      lld_modes=self.eight(1),
+      side_touch_off_distance=0,
+      dispense_positions_above_z_touch_off=self.eight(5),
+      clld_sensitivities=self.eight(1),
+      plld_sensitivities=self.eight(1),
+      swap_speeds=self.eight(100),
+      settling_times=self.eight(5),
+      mix_volumes=self.eight(0),
+      mix_cycles=self.eight(0),
+      mix_positions_from_liquid_surface=self.eight(250),
+      mix_speeds=self.eight(500),
+      mix_surface_following_distances=self.eight(0),
+      adc_algorithms=[False] * 8,
+      tadm_algorithm=False,
+      limit_curve_indices=self.eight(0),
+      recording_mode=0,
+    )
+    self.assertEqual(
+      self.sent(),
+      [
+        "A1PMDDdm3 3 3 3 3 3 3 3tm1 1 1 1 1 1 1 1xp1000 1000 1000 1000 1000 1000 1000 1000"
+        "yp3000 3000 3000 3000 3000 3000 3000 3000"
+        "zx3600 3600 3600 3600 3600 3600 3600 3600lp0 0 0 0 0 0 0 0"
+        "zl0 0 0 0 0 0 0 0po50 50 50 50 50 50 50 50ip0 0 0 0 0 0 0 0"
+        "fp0 0 0 0 0 0 0 0zu0 0 0 0 0 0 0 0zr0 0 0 0 0 0 0 0"
+        "th2450 2450 2450 2450 2450 2450 2450 2450te2450 2450 2450 2450 2450 2450 2450 2450"
+        "dv0005 0005 0005 0005 0005 0005 0005 0005"
+        "ds1200 1200 1200 1200 1200 1200 1200 1200"
+        "ss2500 2500 2500 2500 2500 2500 2500 2500rv0 0 0 0 0 0 0 0"
+        "ta50 50 50 50 50 50 50 50ba0 0 0 0 0 0 0 0lm1 1 1 1 1 1 1 1dj0"
+        "zo5 5 5 5 5 5 5 5ll1 1 1 1 1 1 1 1lv1 1 1 1 1 1 1 1"
+        "de100 100 100 100 100 100 100 100wt5 5 5 5 5 5 5 5"
+        "mv0 0 0 0 0 0 0 0mc0 0 0 0 0 0 0 0mp250 250 250 250 250 250 250 250"
+        "ms500 500 500 500 500 500 500 500mh0 0 0 0 0 0 0 0la0 0 0 0 0 0 0 0"
+        "gj0gi0 0 0 0 0 0 0 0gk0",
+      ],
+    )
+
+
+class AspirateDispenseTestCase(PositioningTestCase):
+  """A driver with a deck, a plate on it, and the machine discovered."""
+
+  async def asyncSetUp(self):
+    from pylabrobot.resources.corning.plates import cor_96_wellplate_360uL_Fb
+
+    self.deck = VantageDeck(size=1.3, name="deck")
+    self.plate = cor_96_wellplate_360uL_Fb("plate")
+    self.deck.assign_child_resource(self.plate, location=Coordinate(300, 200, 50))
+    self.io = ScriptedIO(machine())
+    self.driver = VantageDriver(self.io, deck=self.deck, read_timeout=5)
+    self.driver._connected = True
+    self.driver._router.start()
+    await self.driver.discover()
+    self.io.written.clear()
+    pipettes = self.driver.pipettes
+    assert pipettes is not None
+    self.pipettes = pipettes
+
+
+class TestAspirate(AspirateDispenseTestCase):
+  """Drawing liquid from containers in mm and uL."""
+
+  async def test_the_volumes_and_speeds_are_converted(self):
+    await self.pipettes.aspirate(
+      [self.plate.get_item("A1"), self.plate.get_item("A2")],
+      [100.0, 50.0],
+      liquid_heights=[5.0, 5.0],
+    )
+    command = self.sent()[-1]
+    self.assertTrue(command.startswith("A1PMDA"))
+    written = parameters(command)
+    self.assertEqual(written["av"].split(), ["10000", "5000"] + ["0"] * 6)
+    self.assertEqual(written["as"].split(), ["1000"] * 8)
+
+  async def test_the_liquid_surface_is_the_bottom_plus_the_height(self):
+    await self.pipettes.aspirate(
+      [self.plate.get_item("A1"), self.plate.get_item("A2")],
+      [100.0, 50.0],
+      liquid_heights=[5.0, 5.0],
+    )
+    written = parameters(self.sent()[-1])
+    for surface, bottom in zip(written["zl"].split()[:2], written["zx"].split()[:2]):
+      self.assertEqual(int(surface) - int(bottom), 50)
+
+  async def test_the_places_come_from_the_deck_model(self):
+    await self.pipettes.aspirate([self.plate.get_item("A1")], [100.0], liquid_heights=[5.0])
+    written = parameters(self.sent()[-1])
+    a1 = self.plate.get_item("A1").get_location_wrt(self.deck, x="c", y="c", z="b")
+    self.assertEqual(positions(written["xp"], 8)[0], round(a1.x, 1))
+    self.assertEqual(positions(written["yp"], 8)[0], round(a1.y, 1))
+
+  async def test_the_lld_search_height_is_above_the_well(self):
+    await self.pipettes.aspirate([self.plate.get_item("A1")], [100.0], liquid_heights=[5.0])
+    written = parameters(self.sent()[-1])
+    well = self.plate.get_item("A1")
+    expected = round(well.get_absolute_size_z() * 10) + 17
+    self.assertEqual(int(written["lp"].split()[0]) - int(written["zx"].split()[0]), expected)
+
+  async def test_aspiration_is_booked_in_the_container(self):
+    set_volume_tracking(True)
+    try:
+      well = self.plate.get_item("A1")
+      well.tracker.set_volume(100.0)
+      await self.pipettes.aspirate([well], [40.0])
+      self.assertAlmostEqual(well.tracker.get_used_volume(), 60.0)
+    finally:
+      set_volume_tracking(False)
+
+  async def test_aspirating_more_than_the_container_holds_is_refused(self):
+    set_volume_tracking(True)
+    try:
+      well = self.plate.get_item("A1")
+      well.tracker.set_volume(10.0)
+      with self.assertRaises(TooLittleLiquidError):
+        await self.pipettes.aspirate([well], [40.0])
+      self.assertEqual(self.sent(), [])
+    finally:
+      set_volume_tracking(False)
+
+  async def test_the_last_lld_heights_are_read_in_mm(self):
+    self.io.answers = lambda command: (
+      [echo(command, "rl" + " ".join(["1000"] * 8))] if command.startswith("A1PMRL") else None
+    )
+    self.assertEqual(await self.pipettes.request_lld_heights(), [100.0] * 8)
+
+  async def test_a_search_sets_the_tracker_to_what_it_found(self):
+    well = self.plate.get_item("A1")
+    bottom = well.get_location_wrt(self.deck, x="c", y="c", z="b").z + well.material_z_thickness
+    original = self.io.answers
+    self.io.answers = lambda command: (
+      [echo(command, "rl" + " ".join([str(round((bottom + 5.0) * 10))] * 8))]
+      if command.startswith("A1PMRL")
+      else original(command)
+    )
+    set_volume_tracking(True)
+    try:
+      well.tracker.set_volume(100.0)
+      await self.pipettes.aspirate([well], [10.0], lld_mode=LLDMode.CAPACITIVE)
+      reported = round((bottom + 5.0) * 10) / 10 - bottom
+      self.assertAlmostEqual(
+        well.tracker.get_used_volume(), well.compute_volume_from_height(reported), places=3
+      )
+    finally:
+      set_volume_tracking(False)
+
+  async def test_a_capacitive_search_is_sent(self):
+    await self.pipettes.aspirate([self.plate.get_item("A1")], [100.0], lld_mode=LLDMode.CAPACITIVE)
+    written = parameters(self.sent()[-1])
+    self.assertEqual(written["lm"].split()[:2], ["1", "0"])
+
+  async def test_a_dual_search_is_sent(self):
+    await self.pipettes.aspirate([self.plate.get_item("A1")], [100.0], lld_mode=LLDMode.DUAL)
+    written = parameters(self.sent()[-1])
+    self.assertEqual(written["lm"].split()[0], "3")
+
+  async def test_a_liquid_height_beside_a_search_is_refused(self):
+    with self.assertRaises(ValueError):
+      await self.pipettes.aspirate(
+        [self.plate.get_item("A1")],
+        [100.0],
+        liquid_heights=[5.0],
+        lld_mode=LLDMode.CAPACITIVE,
+      )
+
+  async def test_one_volume_for_each_channel_is_needed(self):
+    with self.assertRaises(ValueError):
+      await self.pipettes.aspirate([self.plate.get_item("A1")], [100.0, 50.0])
+
+  async def test_a_volume_above_the_channels_capacity_is_refused(self):
+    with self.assertRaises(ValueError):
+      await self.pipettes.aspirate([self.plate.get_item("A1")], [1250.1])
+
+
+class TestDispense(AspirateDispenseTestCase):
+  """Giving liquid into containers in mm and uL."""
+
+  async def test_the_volumes_and_speeds_are_converted(self):
+    await self.pipettes.dispense([self.plate.get_item("A1")], [100.0], liquid_heights=[5.0])
+    command = self.sent()[-1]
+    self.assertTrue(command.startswith("A1PMDD"))
+    written = parameters(command)
+    self.assertEqual(written["dv"].split(), ["10000"] + ["0000"] * 7)
+    self.assertEqual(written["ds"].split(), ["1000"] * 8)
+    self.assertEqual(written["ss"].split(), ["50"] * 8)
+
+  async def test_the_mode_comes_from_jet_empty_and_blow_out(self):
+    await self.pipettes.dispense(
+      [self.plate.get_item("A1"), self.plate.get_item("A2")],
+      [100.0, 100.0],
+      jet=[True, False],
+      empty=[False, False],
+      blow_out=[True, True],
+    )
+    written = parameters(self.sent()[-1])
+    self.assertEqual(written["dm"].split()[:2], ["1", "3"])
+
+  async def test_dispensing_is_booked_in_the_container(self):
+    set_volume_tracking(True)
+    try:
+      well = self.plate.get_item("A1")
+      well.tracker.set_volume(10.0)
+      await self.pipettes.dispense([well], [5.0])
+      self.assertAlmostEqual(well.tracker.get_used_volume(), 15.0)
+    finally:
+      set_volume_tracking(False)
+
+  async def test_pressure_and_dual_lld_are_refused(self):
+    for mode in (LLDMode.PRESSURE, LLDMode.DUAL):
+      with self.assertRaises(ValueError):
+        await self.pipettes.dispense([self.plate.get_item("A1")], [100.0], lld_mode=mode)
+
+  async def test_capacitive_and_z_touch_searches_are_sent(self):
+    await self.pipettes.dispense(
+      [self.plate.get_item("A1"), self.plate.get_item("A2")],
+      [100.0, 100.0],
+      lld_mode=[LLDMode.CAPACITIVE, LLDMode.ZTOUCH],
+    )
+    written = parameters(self.sent()[-1])
+    self.assertEqual(written["lm"].split()[:2], ["1", "4"])

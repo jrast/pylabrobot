@@ -130,8 +130,10 @@ def machine(
     if module_and_command == "A1AMMI":
       arm_up[0] = True
       return [echo(command)]
-    if module_and_command in ("A1AMTT", "A1PMTP", "A1PMTR"):
+    if module_and_command in ("A1AMTT", "A1PMTP", "A1PMTR", "A1PMDA", "A1PMDD"):
       return [echo(command)]
+    if module_and_command == "A1PMRL":
+      return [echo(command, "rl" + " ".join(["0"] * num_channels))]
     if module_and_command in ("A1PMDI", "A1RMDI", "A1RMGP"):
       return [echo(command, error=0 if arm_up[0] else 16)]
     if module_and_command in ("A1RMGA", "A1RMDN", "A1RMDG", "A1RMDR"):
