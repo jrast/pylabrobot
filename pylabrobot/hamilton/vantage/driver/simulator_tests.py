@@ -196,6 +196,63 @@ class TestEvents(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(events[0].data["driver"], "VantageSimulationDriver")
 
 
+class TestIpgPlates(unittest.IsolatedAsyncioTestCase):
+  """Moving a plate with the IPG, against the simulated machine."""
+
+  async def asyncSetUp(self):
+    self.driver = VantageSimulationDriver()
+    await self.driver.setup()
+    ipg = self.driver.ipg
+    assert ipg is not None
+    self.ipg = ipg
+
+  async def asyncTearDown(self):
+    await self.driver.stop()
+
+  async def test_a_plate_is_gripped_after_the_orientation_is_prepared(self):
+    self.assertFalse(self.driver.ipg_plate)
+    await self.ipg.prepare_orientation()
+    await self.ipg.grip_plate(100.0, 200.0, 50.0, plate_width=127.8)
+    self.assertTrue(self.driver.ipg_plate)
+    self.assertEqual(self.driver.ipg_gripper_width, 124.5)
+    self.assertEqual(self.driver.ipg_position, (100.0, 200.0, 50.0))
+    self.assertFalse(self.driver.ipg_parked)
+
+  async def test_a_plate_is_put_down_after_the_orientation_is_prepared(self):
+    await self.ipg.prepare_orientation()
+    await self.ipg.grip_plate(100.0, 200.0, 50.0, plate_width=127.8)
+    await self.ipg.put_plate(300.0, 200.0, 50.0, plate_width=127.8)
+    self.assertFalse(self.driver.ipg_plate)
+    self.assertEqual(self.driver.ipg_gripper_width, 131.0)
+    self.assertEqual(self.driver.ipg_position, (300.0, 200.0, 50.0))
+
+  async def test_the_simulated_machine_refuses_a_grip_without_an_orientation(self):
+    with self.assertRaises(VantageFirmwareError) as caught:
+      await self.driver.send_command(
+        "A1RM",
+        "DG",
+        xp=1000,
+        yp=2000,
+        zp=500,
+        yw=81,
+        yo=1310,
+        yg=1245,
+        pt=20,
+        ai=4,
+        zc=0,
+        hd=0,
+        te=2450,
+      )
+    self.assertIn("sequence", str(caught.exception).lower())
+    self.assertFalse(self.driver.ipg_plate)
+
+  async def test_parking_forgets_the_orientation(self):
+    await self.ipg.prepare_orientation()
+    await self.ipg.park()
+    with self.assertRaises(ValueError):
+      await self.ipg.grip_plate(100.0, 200.0, 50.0, plate_width=127.8)
+
+
 if __name__ == "__main__":
   unittest.main()
 

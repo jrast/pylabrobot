@@ -64,7 +64,8 @@ class VantageSimulationDriver(VantageDriver):
   driver sends, and reports anything else as an unknown command.
 
   Like the machine, it refuses to initialize or park the IPG, or to initialize the channels, until
-  the arm has been initialized, and answers error 16.
+  the arm has been initialized, and answers error 16. It refuses to grip or put a plate until the
+  gripper's orientation has been prepared with a `GA`, and answers error 19, as the machine does.
   """
 
   def __init__(
@@ -109,6 +110,15 @@ class VantageSimulationDriver(VantageDriver):
     self.ipg_up = initialized
     self.ipg_parked = initialized
     self.ipg_plate = ipg_plate
+
+    self.ipg_position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    """Where the IPG stands, in mm, after the last move that said so."""
+
+    self.ipg_gripper_width: float = 0.0
+    """How wide the gripper stands, in mm, after the last grip or put."""
+
+    self.ipg_orientation_prepared: bool = False
+    """Whether the wrist has been turned to a grip orientation since the IPG was initialized."""
 
     self.commands: List[str] = []
     """Every command the driver sent, as it would have gone on the wire."""
@@ -185,6 +195,12 @@ class VantageSimulationDriver(VantageDriver):
           "A1RMRS": lambda command: (0, "rs6300 2800 700rr0 272"),
           "A1RMDI": self._initialize_ipg,
           "A1RMGP": self._park_ipg,
+          "A1RMGA": self._prepare_ipg_orientation,
+          "A1RMDN": self._move_ipg,
+          "A1RMDG": self._grip_plate,
+          "A1RMDR": self._put_plate,
+          "A1RMQR": lambda command: (0, ""),
+          "A1RMQI": lambda command: (0, ""),
         }
       )
     return handlers
@@ -226,10 +242,53 @@ class VantageSimulationDriver(VantageDriver):
     if not self.arm_up:
       return 16, ""
     self.ipg_up = True
+    self.ipg_orientation_prepared = False
     return 0, ""
 
   def _park_ipg(self, command: str) -> Tuple[int, str]:
     if not self.arm_up:
       return 16, ""
     self.ipg_parked = True
+    self.ipg_orientation_prepared = False
+    return 0, ""
+
+  def _prepare_ipg_orientation(self, command: str) -> Tuple[int, str]:
+    if not self.ipg_up:
+      return 16, ""
+    self.ipg_orientation_prepared = True
+    self.ipg_parked = False
+    return 0, ""
+
+  def _move_ipg(self, command: str) -> Tuple[int, str]:
+    if not self.ipg_up:
+      return 16, ""
+    written = parameters(command)
+    self.ipg_position = (
+      int(written["xp"]) / 10,
+      int(written["yp"]) / 10,
+      int(written["zp"]) / 10,
+    )
+    self.ipg_parked = False
+    return 0, ""
+
+  def _grip_plate(self, command: str) -> Tuple[int, str]:
+    if not self.ipg_up:
+      return 16, ""
+    if not self.ipg_orientation_prepared:
+      return 19, ""
+    written = parameters(command)
+    self.ipg_plate = True
+    self.ipg_gripper_width = int(written["yg"]) / 10
+    self.ipg_parked = False
+    return 0, ""
+
+  def _put_plate(self, command: str) -> Tuple[int, str]:
+    if not self.ipg_up:
+      return 16, ""
+    if not self.ipg_orientation_prepared:
+      return 19, ""
+    written = parameters(command)
+    self.ipg_plate = False
+    self.ipg_gripper_width = int(written["yo"]) / 10
+    self.ipg_parked = False
     return 0, ""
